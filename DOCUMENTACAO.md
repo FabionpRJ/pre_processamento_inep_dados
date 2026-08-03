@@ -10,18 +10,18 @@ navegável.
 outro, este vale: foi escrito a partir do código atual e é revalidado a cada
 alteração (§9).
 
-Documentos de análise, com o diagnóstico que motivou as alterações mais
-recentes e o registro do que foi aplicado:
+O diagnóstico que motivou as alterações mais recentes está resumido no
+histórico: **§8.6** (usabilidade da interface), **§8.7** (marcador de versão
+nos nomes de arquivo) e **§8.8** (qualidade dos metadados) — cada uma com o
+defeito encontrado, a correção e os números medidos.
 
-| Documento | Assunto |
-|---|---|
-| [RECOMMENDATION.md](RECOMMENDATION.md) | usabilidade da interface Streamlit (§8.6) |
-| [RECOMMENDATION2.md](RECOMMENDATION2.md) | qualidade dos metadados gerados (§8.8) |
-
-> Versões anteriores desta documentação citavam dois documentos irmãos,
-> `INSTRUCOES_ALTERACAO_ETL.md` (população de `var_concept`) e
-> `INSTRUCOES_GERADOR_CENSO_HTML.md` (geração do `censo.html`). **Nenhum dos
-> dois existe no repositório** — os links estavam quebrados. O conteúdo deles
+> Os documentos de análise que originaram essas seções (`RECOMMENDATION.md` e
+> `RECOMMENDATION2.md`) ficam em `OUTROS/`, fora do versionamento: são notas
+> de trabalho internas. O que interessa deles está aqui.
+>
+> Versões anteriores desta documentação também citavam
+> `INSTRUCOES_ALTERACAO_ETL.md` e `INSTRUCOES_GERADOR_CENSO_HTML.md`, que
+> **nunca existiram no repositório** — os links estavam quebrados. O conteúdo
 > está absorvido aqui: `var_concept` em §4 e §8.8, `censo.html` em §4 e §8.2.
 
 ---
@@ -344,7 +344,7 @@ total real de linhas do `.sav`.
 `sum_stats_options` nunca marca peso amostral: o Censo é enumeração completa,
 não amostra.
 
-**Coerência interna garantida** (ver [RECOMMENDATION2.md](RECOMMENDATION2.md)):
+**Coerência interna garantida** (contexto em §8.8):
 
 - `var_intrvl` e `interval_type` valem `"contin"` quando `sum_stats_options`
   marca `mean`, senão `"discrete"` — antes eram `"discrete"` fixo, contradizendo
@@ -731,8 +731,6 @@ registros parciais do Editor depois do teste.
 
 ### 8.6 Usabilidade da interface
 
-Diagnóstico completo em [RECOMMENDATION.md](RECOMMENDATION.md).
-
 **Motivação.** O app funcionava, mas escondia do usuário coisas que ele
 precisava saber: falhas parciais viravam uma linha de log que rolava e sumia,
 erros chegavam como a mensagem crua da exceção, e a barra de progresso dava
@@ -791,9 +789,6 @@ correção valeu de graça para os CSVs, para as abas do dicionário, para os
 questionários (`Escola 2025 V2.pdf`) e para a varredura de zip do `app.py`.
 
 ### 8.8 Qualidade dos metadados gerados
-
-Diagnóstico completo, com os números medidos, em
-[RECOMMENDATION2.md](RECOMMENDATION2.md).
 
 **Motivação.** Auditoria da saída real de 2025 (1.052 variáveis) revelou
 contradições internas nos JSONs e metadados semânticos perdidos em silêncio.
