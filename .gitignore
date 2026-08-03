@@ -1,5 +1,37 @@
+# ---------------------------------------------------------------------------
+# Ambiente e cache do Python
+# ---------------------------------------------------------------------------
 venv/
 __pycache__/
 *.pyc
+.ipynb_checkpoints/
+
+# ---------------------------------------------------------------------------
+# OUTROS/ — tudo que não é necessário para rodar o app
+# ---------------------------------------------------------------------------
+# Insumos do INEP (microdados, dicionário, Caderno, questionários), arquivos
+# de diagnóstico e artefatos já gerados. São centenas de MB; o app recebe os
+# insumos por upload, não os lê do repositório.
+OUTROS/
+desnecessario/
+
+# ---------------------------------------------------------------------------
+# Artefatos gerados pelo pipeline
+# ---------------------------------------------------------------------------
 *.sav
+*.zip
+censo.html
+relatorio_casamento.csv
+*_import_metadata_editor.json
+caderno_conceitos_metadados.json
+censo_html_dados.json
+
+# pastas de saída usadas em execução standalone
+sav/
+saida_censo_escolar/
+
+# ---------------------------------------------------------------------------
+# Configuração local
+# ---------------------------------------------------------------------------
+.streamlit/secrets.toml
 .env

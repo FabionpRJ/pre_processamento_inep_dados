@@ -36,13 +36,15 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import pandas as pd
 
 from censo_lib import (
     TABELAS, NOME_TABELA,
-    ler_csv, encontrar_json, carregar_metadados, gravar_sav,
+    atualizar_case_count, ler_csv, encontrar_json, carregar_metadados,
+    gravar_sav, localizar_csv,
 )
 
 # ---------------------------------------------------------------------------
@@ -131,7 +133,8 @@ def processar_tabela(
     caminho_json: Path,
     caminho_sav: Path,
     modo: int,
-) -> None:
+) -> int:
+    """Grava o .sav da tabela. Retorna o número de linhas gravadas."""
     print(f"\n[{nome}] Lendo CSV ... ", end="", flush=True)
     df_csv = ler_csv(caminho_csv)
     print(f"{len(df_csv):,} linhas · {len(df_csv.columns)} colunas")
@@ -152,6 +155,12 @@ def processar_tabela(
     print(f"  Gravando {caminho_sav} ... ", end="", flush=True)
     mb = gravar_sav(df_final, caminho_sav, variaveis)
     print(f"OK ({mb:.1f} MB)")
+
+    # O JSON de importação nasce no passo 1, antes de existir qualquer linha,
+    # com case_count = 0. Só aqui o total é conhecido.
+    if atualizar_case_count(caminho_json, len(df_final)):
+        print(f"  case_count atualizado para {len(df_final):,} em {caminho_json.name}")
+    return len(df_final)
 
 
 # ---------------------------------------------------------------------------
@@ -180,8 +189,14 @@ def executar(
     pasta_csv: Path,
     pasta_sav: Path,
     modo: int,
+    progresso: Callable[[int, int, str], None] | None = None,
 ) -> list[str]:
-    """Popula .sav com dados dos CSVs. Retorna lista de tabelas com erro."""
+    """Popula .sav com dados dos CSVs. Retorna lista de tabelas com erro.
+
+    `progresso`, se informado, é chamado como (indice, total, tabela) antes de
+    cada tabela. Este é o passo mais lento do pipeline (lê o CSV inteiro), por
+    isso a interface acompanha tabela a tabela em vez de estimar o avanço.
+    """
     pastas_json = [pasta_sav]
     pasta_alt = Path("saida_censo_escolar")
     if pasta_alt.is_dir():
@@ -189,10 +204,11 @@ def executar(
 
     fila: list[tuple[str, Path, Path]] = []
     for nome in tabelas_alvo:
-        csv_path  = pasta_csv / TABELAS[nome]
+        # Casamento ano-agnóstico: aceita Tabela_Escola_2025.csv, _2026.csv etc.
+        csv_path  = localizar_csv(pasta_csv, nome)
         json_path = encontrar_json(nome, pastas_json)
-        if not csv_path.exists():
-            print(f"[aviso] CSV não encontrado — pulando {nome}: {csv_path}")
+        if csv_path is None:
+            print(f"[aviso] CSV não encontrado — pulando {nome} (procurado em: {pasta_csv})")
             continue
         if json_path is None:
             print(f"[aviso] JSON não encontrado — pulando {nome} "
@@ -205,7 +221,9 @@ def executar(
         return tabelas_alvo
 
     erros: list[str] = []
-    for nome, csv_path, json_path in fila:
+    for i, (nome, csv_path, json_path) in enumerate(fila):
+        if progresso:
+            progresso(i, len(fila), nome)
         sav_path = pasta_sav / f"{NOME_TABELA[nome]}.sav"
         try:
             processar_tabela(nome, csv_path, json_path, sav_path, modo)

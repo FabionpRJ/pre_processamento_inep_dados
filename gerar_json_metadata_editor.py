@@ -15,6 +15,15 @@ execuções seguintes reaproveitam o cache e não fazem scraping do PDF de
 novo. Esse alinhamento acontece antes e junto do casamento com os
 questionários, de forma que cada variável é montada em uma única passada.
 
+As três fontes (dicionário, Caderno e questionários) alimentam também o
+`censo.html` gerado ao lado dos JSONs — ver `montar_dicionario_html` e
+gerar_caderno_html.gerar_censo_html.
+
+Recorte por tabela: `tabelas_alvo` restringe quais tabelas viram JSON (e,
+depois, .sav). O dicionário é sempre lido por inteiro, porque é fonte do
+censo.html e base do alinhamento com o Caderno — assim o cache do Caderno
+não depende do recorte pedido em cada execução.
+
     Tabela_de_Escola        -> escola_import_metadata_editor.json
     Tabela_de_Matrícula     -> matricula_import_metadata_editor.json
     Tabela_de_Docente       -> docente_import_metadata_editor.json
@@ -48,6 +57,7 @@ REQUISITOS
 """
 from __future__ import annotations
 
+import csv
 import json
 import re
 import sys
@@ -58,11 +68,24 @@ import openpyxl
 from censo_lib import (
     ABA_PARA_ARQUIVO,
     FID_POR_TABELA,
-    QUESTIONARIO_POR_TABELA,
-    encontrar_questao,
-    extrair_questoes_pdf,
+    ROTULO_TABELA,
+    UNIVERSO_POR_TABELA,
+    encontrar_questao_com_score,
+    extrair_conceitos_html,
+    extrair_questionario_html,
+    extrair_quadros_pdf,
+    fingerprint_fontes,
+    formato_numerico,
+    gravar_cache_versionado,
+    identificar_tabela,
+    largura_variavel,
+    ler_cache_versionado,
+    localizar_questionario,
+    mapear_conceitos_para_concept,
     obter_metadados_caderno,
+    rotulo_conceito,
 )
+from gerar_caderno_html import gerar_censo_html
 
 # ---------------------------------------------------------------------------
 # Constantes locais
@@ -70,12 +93,55 @@ from censo_lib import (
 
 CODE_RE          = re.compile(r"^\s*(-?\d+)\s*-\s*(\S.*)$")
 NAO_APLICAVEL_RE = re.compile(r"^\s*-\s+(\S.*)$")
+PREFIXO_RE       = re.compile(r"^([A-Z]+)_")
 
-SUM_STATS_OPTIONS_PADRAO = {
-    "wgt": True, "freq": True, "missing": True, "vald": True,
-    "min": True, "max": True, "mean": True, "mean_wgt": True,
-    "stdev": True, "stdev_wgt": True,
-}
+# Prefixos de nome de variável do Censo Escolar/INEP que indicam uma
+# quantidade contínua (contagem), mesmo quando o dicionário lista um código
+# de "valor extremo" (ex.: 88888) em rotulos_valor — isso é uma sentinela de
+# qualidade de dado, não uma categoria real.
+PREFIXOS_CONTINUOS      = {"QT"}
+NOMES_CONTINUOS         = {"LATITUDE", "LONGITUDE"}
+# Prefixos que indicam código/identificador administrativo (sem valor
+# analítico agregado: não é categoria nem quantidade).
+PREFIXOS_IDENTIFICADOR  = {"CO", "NU", "ID"}
+# Exceções ao padrão de prefixo: variáveis cujo nome não segue a convenção
+# mas que são identificadores (ex.: NO_ENTIDADE = "Código da Escola", apesar
+# do prefixo NO_ de nome/texto).
+NOMES_IDENTIFICADOR     = {"NO_ENTIDADE"}
+
+
+def determinar_sum_stats_options(var: dict) -> dict:
+    """Decide quais estatísticas-resumo fazem sentido calcular para a variável.
+
+    Não há variável de peso amostral no Censo Escolar (é enumeração completa,
+    não amostra) — por isso wgt/mean_wgt/stdev_wgt são sempre False.
+    """
+    opcoes = {
+        "wgt": False, "freq": False, "missing": True, "vald": True,
+        "min": False, "max": False, "mean": False, "mean_wgt": False,
+        "stdev": False, "stdev_wgt": False,
+    }
+
+    tipo = var["tipo"]
+    nome = var["nome_variavel"]
+    tem_categoria = bool(var["rotulos_valor"])
+    m = PREFIXO_RE.match(nome)
+    prefixo = m.group(1) if m else ""
+
+    if tipo == "Data":
+        opcoes["min"] = opcoes["max"] = True
+    elif nome in NOMES_IDENTIFICADOR:
+        pass
+    elif nome in NOMES_CONTINUOS or prefixo in PREFIXOS_CONTINUOS:
+        opcoes["min"] = opcoes["max"] = opcoes["mean"] = opcoes["stdev"] = True
+    elif tem_categoria:
+        opcoes["freq"] = True
+    elif tipo == "Num" and prefixo not in PREFIXOS_IDENTIFICADOR:
+        opcoes["min"] = opcoes["max"] = opcoes["mean"] = opcoes["stdev"] = True
+    # Char sem categoria (texto livre) e identificadores (CO_/NU_/ID_) ficam
+    # apenas com missing/vald.
+
+    return opcoes
 
 # ---------------------------------------------------------------------------
 # Leitura e interpretação do dicionário (.xlsx)
@@ -180,16 +246,28 @@ def ler_aba(ws) -> dict:
 
 
 def ler_dicionario(caminho_xlsx: Path) -> dict:
+    """Lê o dicionário .xlsx e devolve {tabela: {titulo, variaveis}}.
+
+    As abas são casadas de forma tolerante (ver censo_lib.identificar_tabela):
+    ignora ano, acento, caixa e separadores, de modo que um dicionário novo com
+    grafia levemente diferente continue sendo reconhecido. Abas não
+    reconhecidas são ignoradas; o recorte por tabela é feito em `executar`.
+    """
     wb = openpyxl.load_workbook(caminho_xlsx, data_only=True)
-    tabelas = {}
-    abas_por_nome_limpo = {nome.strip(): nome for nome in wb.sheetnames}
-    for aba_dicionario, nome_arquivo in ABA_PARA_ARQUIVO.items():
-        nome_real = abas_por_nome_limpo.get(aba_dicionario)
-        if nome_real is None:
-            print(f'[aviso] aba "{aba_dicionario}" não encontrada no arquivo; pulando.')
-            continue
-        tabelas[nome_arquivo] = ler_aba(wb[nome_real])
-    return tabelas
+    abas_por_tabela: dict[str, str] = {}
+    for nome_aba in wb.sheetnames:
+        tabela = identificar_tabela(nome_aba.strip())
+        if tabela:
+            abas_por_tabela.setdefault(tabela, nome_aba)
+        else:
+            print(f'[aviso] aba "{nome_aba}" não reconhecida como tabela do Censo; ignorando.')
+
+    # Preserva a ordem canônica das tabelas, não a ordem das abas do arquivo.
+    return {
+        nome_arquivo: ler_aba(wb[abas_por_tabela[nome_arquivo]])
+        for nome_arquivo in ABA_PARA_ARQUIVO.values()
+        if nome_arquivo in abas_por_tabela
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +275,13 @@ def ler_dicionario(caminho_xlsx: Path) -> dict:
 # ---------------------------------------------------------------------------
 
 def montar_var_format(var: dict) -> dict:
+    """Formato declarado da variável.
+
+    O formato numérico vem de `censo_lib.formato_numerico`, a mesma função
+    usada na gravação do .sav — antes este módulo emitia sempre `F{n}.0`
+    enquanto o .sav saía com o padrão F8.2 do pyreadstat, e os dois
+    artefatos do mesmo pipeline se contradiziam.
+    """
     tipo = var["tipo"]
     if tipo in ("Char", "Data"):
         largura = int(var["tamanho"]) if var["tamanho"] else 1
@@ -204,10 +289,9 @@ def montar_var_format(var: dict) -> dict:
             "type": "character", "schema": "other", "readstat_type": "string",
             "data_format": f"A{largura}", "is_date": tipo == "Data",
         }
-    largura = int(var["tamanho"]) if var["tamanho"] else 8
     return {
         "type": "numeric", "schema": "other", "readstat_type": "double",
-        "data_format": f"F{largura}.0", "is_date": False,
+        "data_format": formato_numerico(var), "is_date": False,
     }
 
 
@@ -228,10 +312,14 @@ def montar_variavel(
     fid: str,
     questao_literal: str = "",
     conceito: dict | None = None,
+    conceito_concept: dict | None = None,
+    universo: str = "",
 ) -> dict:
-    tipo = var["tipo"]
     var_format = montar_var_format(var)
-    loc_width = int(var["tamanho"]) if (tipo in ("Char", "Data") and var["tamanho"]) else 8
+    # Largura declarada segue o dicionário para todos os tipos — antes as
+    # numéricas ficavam fixas em 8, contradizendo o próprio `data_format`
+    # do mesmo objeto (ex.: LATITUDE com F20 e loc_width 8).
+    loc_width = largura_variavel(var)
     sid = fid.replace("F", "")
 
     categorias = [
@@ -249,6 +337,28 @@ def montar_variavel(
     if nota_caderno:
         var_notes = f"{var_notes}\n{nota_caderno}".strip() if var_notes else nota_caderno
 
+    # Anos de coleta descrevem o PERÍODO, não a população — por isso saíram
+    # de var_universe (que agora recebe o universo da tabela) e vieram para
+    # as notas.
+    anos = _anos_coletados(var)
+    if anos:
+        var_notes = f"{var_notes}\n{anos}".strip() if var_notes else anos
+
+    # Conceito casado a partir da mesma estrutura que alimenta o censo.html
+    # (ver censo_lib.mapear_conceitos_para_concept). Guarda o TÍTULO do
+    # conceito, não a definição: no DDI `concept` é um rótulo curto ligado a
+    # vocabulário controlado, e a definição completa já vai em var_txt —
+    # antes o mesmo parágrafo (até 1807 caracteres) ia nos dois campos.
+    titulo_concept = rotulo_conceito((conceito_concept or {}).get("conceito", ""))
+    var_concept = [[{"concept": titulo_concept, "vocab": "", "vocabURI": ""}]] if titulo_concept else [[]]
+
+    # Contínua vs discreta: `determinar_sum_stats_options` já distingue os
+    # dois casos (QT_, lat/long, datas, presença de categorias). Antes
+    # var_intrvl era "discrete" fixo, contradizendo as 707 variáveis que o
+    # mesmo objeto marcava com mean/stdev.
+    opcoes_sumstat = determinar_sum_stats_options(var)
+    intervalo = "contin" if opcoes_sumstat["mean"] else "discrete"
+
     return {
         "uid":                  str(indice),
         "sid":                  sid,
@@ -257,7 +367,7 @@ def montar_variavel(
         "name":                 var["nome_variavel"],
         "labl":                 var["descricao"],
         "sort_order":           str(indice - 1),
-        "var_intrvl":           "discrete",
+        "var_intrvl":           intervalo,
         "loc_width":            loc_width,
         "var_invalrng":         {"values": []},
         "var_valrng":           {"range": {"UNITS": "REAL", "count": 0, "min": "", "max": ""}},
@@ -267,11 +377,11 @@ def montar_variavel(
         "var_format":           var_format,
         "var_format_original":  var_format,
         "file_id":              fid,
-        "interval_type":        "discrete",
-        "sum_stats_options":    SUM_STATS_OPTIONS_PADRAO,
-        "var_concept":          [[]],
+        "interval_type":        intervalo,
+        "sum_stats_options":    opcoes_sumstat,
+        "var_concept":          var_concept,
         "var_wgt_id":           "",
-        "var_universe":         _anos_coletados(var),
+        "var_universe":         universo,
         "var_txt":              var_txt,
         "var_security":         "",
         "var_notes":            var_notes,
@@ -304,18 +414,30 @@ def gerar_json_importacao(
     titulo: str,
     variaveis: list[dict],
     pasta_saida: Path,
-    questoes: list[str] | None = None,
+    questao_por_variavel: dict[str, str] | None = None,
     conceitos_por_variavel: dict[str, dict] | None = None,
+    concept_por_variavel: dict[str, dict] | None = None,
 ) -> Path:
+    """Monta e grava o JSON de importação de uma tabela.
+
+    `questao_por_variavel` já vem resolvido por `executar`: o casamento
+    descrição↔questão é caro (O(variáveis × questões)) e antes era refeito
+    do zero aqui, depois de já ter sido calculado só para contar acertos no
+    log.
+    """
     fid = FID_POR_TABELA.get(nome_arquivo, "F1")
-    questoes = questoes or []
+    questao_por_variavel = questao_por_variavel or {}
     conceitos_por_variavel = conceitos_por_variavel or {}
+    concept_por_variavel = concept_por_variavel or {}
+    universo = UNIVERSO_POR_TABELA.get(nome_arquivo, "")
 
     vars_montadas = [
         montar_variavel(
             v, i + 1, fid,
-            encontrar_questao(v["descricao"], questoes),
+            questao_por_variavel.get(v["nome_variavel"], ""),
             conceitos_por_variavel.get(v["nome_variavel"]),
+            concept_por_variavel.get(v["nome_variavel"]),
+            universo,
         )
         for i, v in enumerate(variaveis)
     ]
@@ -328,6 +450,33 @@ def gerar_json_importacao(
     caminho = pasta_saida / f"{nome_arquivo}_import_metadata_editor.json"
     with open(caminho, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
+    return caminho
+
+
+def gravar_relatorio_casamento(linhas: list[dict], pasta_saida: Path) -> Path | None:
+    """Grava o CSV de auditoria dos casamentos heurísticos.
+
+    Boa parte dos metadados semânticos (var_concept, var_qstn_qstnlit,
+    var_txt) vem de casamento por similaridade, e o log só mostrava
+    contagens agregadas. Este arquivo permite a um especialista conferir
+    variável a variável o que foi atribuído e com que pontuação — a revisão
+    que este tipo de produto exige antes de publicar.
+    """
+    if not linhas:
+        return None
+    colunas = ["tabela", "variavel", "descricao", "conceito", "tem_var_txt",
+               "questao", "score_questao"]
+    caminho = pasta_saida / "relatorio_casamento.csv"
+    try:
+        # utf-8-sig: o Excel em pt-BR abre o CSV com acentuação correta.
+        with open(caminho, "w", encoding="utf-8-sig", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=colunas, delimiter=";")
+            writer.writeheader()
+            for linha in linhas:
+                writer.writerow({c: linha.get(c, "") for c in colunas})
+    except OSError as exc:
+        print(f"  [aviso] Não foi possível gravar o relatório de casamento: {exc}")
+        return None
     return caminho
 
 
@@ -348,16 +497,69 @@ def localizar_caderno_padrao() -> Path | None:
 # API pública (usada por main.py)
 # ---------------------------------------------------------------------------
 
+def montar_dicionario_html(tabelas: dict[str, dict]) -> list[dict]:
+    """Estrutura o dicionário de variáveis para o bloco `app-data` do censo.html.
+
+    Mesma fonte que alimenta os JSONs do Metadata Editor (a leitura do .xlsx em
+    `ler_dicionario`) — o HTML não reparseia a planilha. Só entram as tabelas já
+    filtradas, então o censo.html reflete exatamente o que foi enviado.
+    """
+    return [
+        {
+            "id":     nome_arquivo,
+            "titulo": ROTULO_TABELA.get(nome_arquivo, nome_arquivo),
+            "fonte":  info["titulo"],
+            "variaveis": [
+                {
+                    "ordem":      v["ordem"],
+                    "nome":       v["nome_variavel"],
+                    "descricao":  v["descricao"],
+                    "tipo":       v["tipo"],
+                    "tamanho":    v["tamanho"],
+                    "universo":   _anos_coletados(v),
+                    "notas":      v.get("notas_importantes") or "",
+                    "categorias": [
+                        {"valor": str(codigo), "rotulo": texto}
+                        for codigo, texto in sorted(v["rotulos_valor"].items())
+                    ],
+                    "aplicabilidade": v.get("notas_aplicabilidade_categoria") or [],
+                }
+                for v in info["variaveis"]
+            ],
+        }
+        for nome_arquivo, info in tabelas.items()
+    ]
+
+
 def executar(
     caminho_xlsx: Path,
     pasta_saida: Path,
     pasta_questionarios: Path | None = None,
     caminho_caderno: Path | None = None,
+    gerar_html: bool = True,
+    incluir_questionarios: bool = True,
+    tabelas_alvo: list[str] | None = None,
 ) -> None:
     if not caminho_xlsx.exists():
         sys.exit(f'Arquivo não encontrado: "{caminho_xlsx}"')
     print(f'Lendo dicionário: "{caminho_xlsx}"')
-    tabelas = ler_dicionario(caminho_xlsx)
+
+    # O dicionário é sempre lido por inteiro: ele é uma das fontes do
+    # censo.html e a base do alinhamento com o Caderno (cache estável,
+    # independente do recorte). `tabelas_alvo` restringe apenas quais tabelas
+    # viram JSON/.sav — ver o laço final.
+    tabelas_todas = ler_dicionario(caminho_xlsx)
+    if not tabelas_todas:
+        sys.exit("Nenhuma aba reconhecida no dicionário.")
+    alvo = list(tabelas_alvo) if tabelas_alvo else list(tabelas_todas)
+    tabelas = {nome: info for nome, info in tabelas_todas.items() if nome in alvo}
+    faltantes = [t for t in alvo if t not in tabelas_todas]
+    if faltantes:
+        print(f"  [aviso] Sem aba no dicionário para: {', '.join(faltantes)}")
+    if not tabelas:
+        sys.exit("Nenhuma aba do dicionário correspondeu às tabelas solicitadas.")
+    print(f"  Abas lidas: {', '.join(tabelas_todas)}")
+    print(f"  JSONs a gerar: {', '.join(tabelas)}")
     pasta_saida.mkdir(parents=True, exist_ok=True)
 
     usar_pdfs = pasta_questionarios is not None and pasta_questionarios.is_dir()
@@ -366,11 +568,34 @@ def executar(
     else:
         print("[aviso] Pasta de questionários não informada; var_qstn_qstnlit ficará vazio.")
 
+    # Resolve uma vez o PDF de cada tabela (nome ano-agnóstico) e reaproveita
+    # tanto no casamento de var_qstn_qstnlit quanto na aba do censo.html.
+    # Resolve para todas as tabelas do dicionário: os questionários enviados
+    # entram inteiros no censo.html, mesmo os de tabelas fora do recorte.
+    # Um mesmo PDF serve mais de uma tabela (Turma alimenta turma e
+    # curso_tecnico) e é lido tanto para o censo.html quanto para o
+    # casamento — memoriza para não reparsear o arquivo a cada uso.
+    cache_perguntas: dict[Path, list[dict]] = {}
+
+    def perguntas_do_pdf(pdf_path: Path) -> list[dict]:
+        if pdf_path not in cache_perguntas:
+            cache_perguntas[pdf_path] = extrair_questionario_html(pdf_path)
+        return cache_perguntas[pdf_path]
+
+    pdf_por_tabela: dict[str, Path] = {}
+    if usar_pdfs:
+        for nome_arquivo in tabelas_todas:
+            pdf = localizar_questionario(pasta_questionarios, nome_arquivo)
+            if pdf:
+                pdf_por_tabela[nome_arquivo] = pdf
+            elif nome_arquivo in tabelas:
+                print(f"  [aviso] Questionário PDF não encontrado para {nome_arquivo}.")
+
     # Estrutura os conceitos/orientações do Caderno alinhados por variável,
     # antes de montar qualquer JSON. Se já existir um cache estruturado em
     # `pasta_saida`, o scraping do PDF é ignorado.
     caminho_cache_caderno = pasta_saida / "caderno_conceitos_metadados.json"
-    tabelas_variaveis = {nome: info["variaveis"] for nome, info in tabelas.items()}
+    tabelas_variaveis = {nome: info["variaveis"] for nome, info in tabelas_todas.items()}
     print("Metadados do Caderno de Conceitos:")
     metadados_caderno = obter_metadados_caderno(
         caminho_caderno, caminho_cache_caderno, tabelas_variaveis
@@ -378,30 +603,149 @@ def executar(
     if not metadados_caderno:
         print("  [aviso] Nenhum metadado do Caderno disponível; var_txt/var_qstn_ivuinstr do Caderno ficarão vazios.")
 
-    for nome_arquivo, info in tabelas.items():
-        questoes: list[str] = []
-        if usar_pdfs:
-            nome_pdf = QUESTIONARIO_POR_TABELA.get(nome_arquivo)
-            if nome_pdf:
-                pdf_path = pasta_questionarios / nome_pdf
-                if pdf_path.exists():
-                    questoes = extrair_questoes_pdf(pdf_path)
-                else:
-                    print(f"  [aviso] PDF não encontrado: {pdf_path}")
+    # ---- Conceitos estruturados do Caderno (mesma fonte do censo.html) -----
+    # Extração rica por CONCEITO (ver extrair_conceitos_html), independente
+    # da flag `gerar_html`: além de alimentar o censo.html, é a fonte usada
+    # abaixo para casar conceito↔variável e popular var_concept (ver
+    # INSTRUCOES_ALTERACAO_ETL.md). Falha graciosa: sem Caderno, segue com
+    # listas vazias.
+    conceitos_html: list[dict] = []
+    quadros_html: list[dict] = []
+    if caminho_caderno and caminho_caderno.is_file():
+        caminho_cache_censo = pasta_saida / "censo_html_dados.json"
+        # Este cache depende só do PDF (a extração por conceito não olha o
+        # dicionário), mas passa pelo mesmo controle de versão.
+        fp_censo = fingerprint_fontes(caminho_caderno)
+        try:
+            dados_censo = ler_cache_versionado(caminho_cache_censo, fp_censo)
+            if dados_censo is not None:
+                print(f"  Dados de conceitos já estruturados: {caminho_cache_censo.name} (scraping do PDF ignorado)")
+                conceitos_html = dados_censo["conceitos"]
+                quadros_html = dados_censo["quadros"]
+            else:
+                conceitos_html = extrair_conceitos_html(caminho_caderno)
+                quadros_html = extrair_quadros_pdf(caminho_caderno)
+                gravar_cache_versionado(
+                    caminho_cache_censo, fp_censo,
+                    {"conceitos": conceitos_html, "quadros": quadros_html},
+                )
+        except Exception as exc:
+            print(f"  [aviso] Não foi possível extrair conceitos/quadros do Caderno: {exc}")
 
+    # ---- Questionários (PDF) — estrutura para o censo.html -------------------
+    # Reaproveita a extração já usada para casar var_qstn_qstnlit (ver
+    # extrair_questionario_html/extrair_questoes_pdf) — não reparseia o PDF.
+    # Um mesmo arquivo usado por mais de uma tabela (ex. "Turma 2025.pdf",
+    # usado por turma e curso_tecnico) aparece uma única vez no censo.html.
+    questionarios_html: list[dict] = []
+    if not incluir_questionarios:
+        print("  [info] Questionários (PDF) não serão incluídos no censo.html.")
+    elif pdf_por_tabela:
+        pdfs_vistos: set[str] = set()
+        for nome_arquivo, pdf_path in pdf_por_tabela.items():
+            if pdf_path.name in pdfs_vistos:
+                continue
+            pdfs_vistos.add(pdf_path.name)
+            perguntas = perguntas_do_pdf(pdf_path)
+            if perguntas:
+                titulo_pdf = re.sub(r"\s*\d{4}$", "", pdf_path.stem).strip() or pdf_path.stem
+                questionarios_html.append({"id": nome_arquivo, "titulo": titulo_pdf, "perguntas": perguntas})
+        if questionarios_html:
+            n_perguntas = sum(len(q["perguntas"]) for q in questionarios_html)
+            print(f"  Questionários estruturados: {n_perguntas} pergunta(s) em {len(questionarios_html)} questionário(s).")
+
+    # ---- censo.html — Caderno de Conceitos navegável ------------------------
+    # Artefato independente (sem backend). Falha graciosa: sem conceitos
+    # extraídos, avisa e segue o pipeline sem gerar o HTML.
+    # As três fontes de metadados (dicionário, Caderno e questionários) vão
+    # juntas para o censo.html — é o mesmo material que alimenta os JSONs.
+    dicionario_html = montar_dicionario_html(tabelas_todas)
+    if not gerar_html:
+        print("  [info] Geração de censo.html desativada pelo usuário.")
+    elif conceitos_html or quadros_html or questionarios_html or dicionario_html:
+        print("Gerando censo.html (dicionário + Caderno de Conceitos + questionários)...")
+        try:
+            caminho_censo_html = gerar_censo_html(
+                conceitos_html, quadros_html, pasta_saida / "censo.html",
+                questionarios_html, dicionario=dicionario_html,
+            )
+            n_vars_html = sum(len(t["variaveis"]) for t in dicionario_html)
+            print(
+                f"  OK: censo.html ({len(conceitos_html)} conceitos, {len(quadros_html)} quadros, "
+                f"{len(questionarios_html)} questionário(s), "
+                f"{n_vars_html} variáveis em {len(dicionario_html)} tabela(s)) -> {caminho_censo_html}"
+            )
+        except Exception as exc:
+            print(f"  [aviso] Não foi possível gerar censo.html: {exc}")
+    else:
+        print("  [aviso] Nenhuma fonte disponível; censo.html não será gerado.")
+
+    # ---- var_concept — casamento conceito↔variável --------------------------
+    mapa_concept = mapear_conceitos_para_concept(conceitos_html, tabelas_variaveis)
+    if conceitos_html:
+        n_concept = sum(len(v) for v in mapa_concept.values())
+        print(f"  Conceitos casados a {n_concept} variável(is) em {len(mapa_concept)} tabela(s) (var_concept).")
+
+    linhas_relatorio: list[dict] = []
+    for nome_arquivo, info in tabelas.items():
+        pdf_path = pdf_por_tabela.get(nome_arquivo)
+        questoes = [p["texto"] for p in perguntas_do_pdf(pdf_path)] if pdf_path else []
         n_questoes = len(questoes)
-        n_com_match = sum(
-            1 for v in info["variaveis"]
-            if encontrar_questao(v["descricao"], questoes)
-        )
+        n_vars = len(info["variaveis"])
+
+        # Casamento resolvido UMA vez e reaproveitado no log, no JSON e no
+        # relatório de auditoria.
+        casamento = {
+            v["nome_variavel"]: encontrar_questao_com_score(v["descricao"], questoes)
+            for v in info["variaveis"]
+        }
+        questao_por_variavel = {nome: texto for nome, (texto, _) in casamento.items()}
+        n_com_match = sum(1 for texto, _ in casamento.values() if texto)
+
         conceitos_tabela = metadados_caderno.get(nome_arquivo, {})
+        concept_tabela = mapa_concept.get(nome_arquivo, {})
         caminho = gerar_json_importacao(
-            nome_arquivo, info["titulo"], info["variaveis"], pasta_saida, questoes,
-            conceitos_tabela,
+            nome_arquivo, info["titulo"], info["variaveis"], pasta_saida,
+            questao_por_variavel, conceitos_tabela, concept_tabela,
         )
-        match_info = f", {n_com_match}/{len(info['variaveis'])} vars com questão" if n_questoes else ""
-        conceito_info = f", {len(conceitos_tabela)}/{len(info['variaveis'])} vars com conceito" if conceitos_tabela else ""
-        print(f"  OK: {caminho.name}  ({len(info['variaveis'])} vars, {n_questoes} questões PDF{match_info}{conceito_info})")
+
+        for v in info["variaveis"]:
+            nome_var = v["nome_variavel"]
+            texto_q, score_q = casamento[nome_var]
+            conceito_casado = concept_tabela.get(nome_var) or {}
+            linhas_relatorio.append({
+                "tabela":          nome_arquivo,
+                "variavel":        nome_var,
+                "descricao":       v["descricao"],
+                "conceito":        rotulo_conceito(conceito_casado.get("conceito", "")),
+                "tem_var_txt":     "sim" if conceitos_tabela.get(nome_var, {}).get("var_txt") else "",
+                "questao":         texto_q,
+                "score_questao":   f"{score_q:.3f}" if texto_q else "",
+            })
+
+        match_info = f", {n_com_match}/{n_vars} vars com questão" if n_questoes else ""
+        conceito_info = f", {len(conceitos_tabela)}/{n_vars} vars com conceito" if conceitos_tabela else ""
+        concept_info = f", {len(concept_tabela)}/{n_vars} vars com var_concept" if concept_tabela else ""
+        print(f"  OK: {caminho.name}  ({n_vars} vars, {n_questoes} questões PDF{match_info}{conceito_info}{concept_info})")
+
+        # Uma tabela que sai sem nenhum metadado semântico é sempre sintoma
+        # de problema (questionário não numerado, seção do Caderno que não
+        # corresponde à tabela) — antes isso passava como um "0" discreto.
+        rotulo = ROTULO_TABELA.get(nome_arquivo, nome_arquivo)
+        if n_questoes == 0:
+            print(f"    [AVISO] {rotulo}: nenhuma questão disponível — "
+                  f"var_qstn_qstnlit ficará vazio nas {n_vars} variáveis.")
+        elif n_com_match == 0:
+            print(f"    [AVISO] {rotulo}: {n_questoes} questões extraídas, mas "
+                  f"nenhuma casou com as variáveis — var_qstn_qstnlit vazio.")
+        if not concept_tabela:
+            print(f"    [AVISO] {rotulo}: nenhum conceito do Caderno casou — "
+                  f"var_concept ficará vazio nas {n_vars} variáveis.")
+
+    caminho_relatorio = gravar_relatorio_casamento(linhas_relatorio, pasta_saida)
+    if caminho_relatorio:
+        print(f"  Relatório de casamento: {caminho_relatorio.name} "
+              f"({len(linhas_relatorio)} linhas) — revise antes de publicar.")
 
     print(f"\nJSONs gravados em: {pasta_saida.resolve()}")
 

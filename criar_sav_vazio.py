@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import pandas as pd
@@ -39,13 +40,11 @@ from censo_lib import (
 # ---------------------------------------------------------------------------
 
 def montar_df_vazio(variaveis: list[dict]) -> pd.DataFrame:
-    df = pd.DataFrame()
-    for var in variaveis:
-        if var["tipo"] in ("Char", "Data"):
-            df[var["nome_variavel"]] = pd.Series(dtype="object")
-        else:
-            df[var["nome_variavel"]] = pd.Series(dtype="float64")
-    return df
+    colunas = {
+        var["nome_variavel"]: pd.Series(dtype="object" if var["tipo"] in ("Char", "Data") else "float64")
+        for var in variaveis
+    }
+    return pd.concat(colunas, axis=1)
 
 
 def criar_sav_vazio_tabela(nome: str, caminho_json: Path, pasta_saida: Path) -> Path:
@@ -67,15 +66,23 @@ def executar(
     tabelas_alvo: list[str],
     pasta_json: Path,
     pasta_saida: Path,
+    progresso: Callable[[int, int, str], None] | None = None,
 ) -> list[str]:
-    """Cria .sav vazios para cada tabela. Retorna lista de tabelas com erro."""
+    """Cria .sav vazios para cada tabela. Retorna lista de tabelas com erro.
+
+    `progresso`, se informado, é chamado como (indice, total, tabela) antes de
+    cada tabela — usado pela interface para mostrar avanço real, e não estimado.
+    """
     pastas_json = [pasta_json]
     pasta_alt = Path("saida_censo_escolar")
     if pasta_alt.is_dir():
         pastas_json.append(pasta_alt)
 
     erros: list[str] = []
-    for nome in tabelas_alvo:
+    total = len(tabelas_alvo)
+    for i, nome in enumerate(tabelas_alvo):
+        if progresso:
+            progresso(i, total, nome)
         json_path = encontrar_json(nome, pastas_json)
         if json_path is None:
             print(f"[aviso] JSON não encontrado para {nome} — pulando.")
