@@ -14,6 +14,11 @@ Dois modos de geração:
   [2] Apenas disponíveis — o .sav inclui somente as colunas presentes no CSV
       (mantém a ordem do dicionário; colunas extras do CSV vêm ao final).
 
+FERRAMENTA STANDALONE. A interface (app.py) produz apenas metadados e não
+chama mais este módulo. Como consequência, o `case_count` dos JSONs sai 0
+do serviço: só quem lê os dados conhece o número de linhas, e é este módulo
+que o regrava (ver `censo_lib.atualizar_case_count`).
+
 USO (standalone)
 ----------------
     python popular_sav.py [pasta_csv] [pasta_sav] [--modo {1,2}] [--tabelas ...]
@@ -42,9 +47,9 @@ from pathlib import Path
 import pandas as pd
 
 from censo_lib import (
-    TABELAS, NOME_TABELA,
+    TABELAS,
     atualizar_case_count, ler_csv, encontrar_json, carregar_metadados,
-    gravar_sav, localizar_csv,
+    gravar_sav, nome_sav_do_json, resolver_csvs,
 )
 
 # ---------------------------------------------------------------------------
@@ -202,11 +207,37 @@ def executar(
     if pasta_alt.is_dir():
         pastas_json.append(pasta_alt)
 
+    # Os JSONs do passo 1 já trazem, por tabela, as variáveis que o dicionário
+    # declara. Passá-las ao resolvedor habilita a identificação por CONTEÚDO:
+    # se o nome do CSV não for reconhecível, o cabeçalho decide qual tabela é.
+    jsons_por_tabela = {
+        nome: caminho
+        for nome in tabelas_alvo
+        if (caminho := encontrar_json(nome, pastas_json)) is not None
+    }
+    variaveis_por_tabela: dict[str, set[str]] = {}
+    for nome, caminho in jsons_por_tabela.items():
+        try:
+            variaveis_por_tabela[nome] = {
+                v["nome_variavel"].strip().upper()
+                for v in carregar_metadados(caminho) if v.get("nome_variavel")
+            }
+        except Exception as exc:
+            print(f"[aviso] não foi possível ler as variáveis de {caminho.name}: {exc}")
+
+    resolucao = resolver_csvs(pasta_csv, variaveis_por_tabela)
+    csvs_por_tabela = resolucao["por_tabela"]
+    for det in resolucao["detalhes"]:
+        if det["camada"] == "conteudo" and det["conflito"]:
+            print(f"[aviso] {det['arquivo']}: nome e cabeçalho discordam; "
+                  f"vale o cabeçalho → {det['tabela']} ({det['pontos']:.2f}).")
+    for p in resolucao["nao_resolvidos"]:
+        print(f"[aviso] CSV não identificado, ignorado: {p.name}")
+
     fila: list[tuple[str, Path, Path]] = []
     for nome in tabelas_alvo:
-        # Casamento ano-agnóstico: aceita Tabela_Escola_2025.csv, _2026.csv etc.
-        csv_path  = localizar_csv(pasta_csv, nome)
-        json_path = encontrar_json(nome, pastas_json)
+        csv_path  = csvs_por_tabela.get(nome)
+        json_path = jsons_por_tabela.get(nome)
         if csv_path is None:
             print(f"[aviso] CSV não encontrado — pulando {nome} (procurado em: {pasta_csv})")
             continue
@@ -224,7 +255,8 @@ def executar(
     for i, (nome, csv_path, json_path) in enumerate(fila):
         if progresso:
             progresso(i, len(fila), nome)
-        sav_path = pasta_sav / f"{NOME_TABELA[nome]}.sav"
+        # Mesmo nome que o passo 2 gravou: vem do `datafile.file_name` do JSON.
+        sav_path = pasta_sav / nome_sav_do_json(json_path, nome)
         try:
             processar_tabela(nome, csv_path, json_path, sav_path, modo)
         except Exception as exc:

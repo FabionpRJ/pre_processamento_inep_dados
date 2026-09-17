@@ -9,6 +9,11 @@ do dicionário: rótulos de variável/valor, tipos e formatos.
 Útil para registrar a estrutura completa no Metadata Editor antes de
 popular os arquivos com dados.
 
+FERRAMENTA STANDALONE. A interface (app.py) produz apenas metadados e não
+chama mais este módulo: os microdados deixaram de ser insumo do serviço.
+Ele continua aqui porque gerar .sav a partir dos JSONs segue sendo útil
+fora do serviço — basta ter em mãos os JSONs do passo de metadados.
+
 USO (standalone)
 ----------------
     python criar_sav_vazio.py                        # JSONs e .sav em ./sav
@@ -31,8 +36,8 @@ from pathlib import Path
 import pandas as pd
 
 from censo_lib import (
-    TABELAS, NOME_TABELA,
-    encontrar_json, carregar_metadados, gravar_sav,
+    TABELAS,
+    encontrar_json, carregar_metadados, gravar_sav, nome_sav_do_json,
 )
 
 # ---------------------------------------------------------------------------
@@ -51,7 +56,10 @@ def criar_sav_vazio_tabela(nome: str, caminho_json: Path, pasta_saida: Path) -> 
     variaveis = carregar_metadados(caminho_json)
     df = montar_df_vazio(variaveis)
     pasta_saida.mkdir(parents=True, exist_ok=True)
-    caminho_sav = pasta_saida / f"{NOME_TABELA[nome]}.sav"
+    # O nome do .sav vem do próprio JSON (`datafile.file_name`), gravado pelo
+    # passo 1 — fonte única, para que o arquivo e o campo que o Metadata Editor
+    # usa para amarrá-lo ao JSON não possam divergir.
+    caminho_sav = pasta_saida / nome_sav_do_json(caminho_json, nome)
     print(f"  [{nome}] Gravando {caminho_sav} ... ", end="", flush=True)
     mb = gravar_sav(df, caminho_sav, variaveis)
     print(f"OK ({mb:.1f} MB, {len(variaveis)} variáveis, 0 linhas)")

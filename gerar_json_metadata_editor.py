@@ -19,8 +19,8 @@ As três fontes (dicionário, Caderno e questionários) alimentam também o
 `censo.html` gerado ao lado dos JSONs — ver `montar_dicionario_html` e
 gerar_caderno_html.gerar_censo_html.
 
-Recorte por tabela: `tabelas_alvo` restringe quais tabelas viram JSON (e,
-depois, .sav). O dicionário é sempre lido por inteiro, porque é fonte do
+Recorte por tabela: `tabelas_alvo` restringe quais tabelas viram JSON. O
+dicionário é sempre lido por inteiro, porque é fonte do
 censo.html e base do alinhamento com o Caderno — assim o cache do Caderno
 não depende do recorte pedido em cada execução.
 
@@ -67,9 +67,10 @@ import openpyxl
 
 from censo_lib import (
     ABA_PARA_ARQUIVO,
+    descrever_imputacao, parece_sentinela, separar_codigos_especiais,
     FID_POR_TABELA,
     ROTULO_TABELA,
-    UNIVERSO_POR_TABELA,
+    universo_publicacao,
     encontrar_questao_com_score,
     extrair_conceitos_html,
     extrair_questionario_html,
@@ -79,8 +80,12 @@ from censo_lib import (
     gravar_cache_versionado,
     identificar_tabela,
     largura_variavel,
+    detectar_ano_censo,
     ler_cache_versionado,
     localizar_questionario,
+    nome_saida_json,
+    nome_saida_sav,
+    prefixo_edicao,
     mapear_conceitos_para_concept,
     obter_metadados_caderno,
     rotulo_conceito,
@@ -96,9 +101,11 @@ NAO_APLICAVEL_RE = re.compile(r"^\s*-\s+(\S.*)$")
 PREFIXO_RE       = re.compile(r"^([A-Z]+)_")
 
 # Prefixos de nome de variável do Censo Escolar/INEP que indicam uma
-# quantidade contínua (contagem), mesmo quando o dicionário lista um código
-# de "valor extremo" (ex.: 88888) em rotulos_valor — isso é uma sentinela de
-# qualidade de dado, não uma categoria real.
+# quantidade contínua (contagem). Os códigos de "valor extremo" (ex.: 88888)
+# que o dicionário lista em rotulos_valor deixaram de contar como categoria
+# por conta própria (ver `separar_codigos_especiais`), então esta lista já não
+# precisa compensar isso — segue valendo para as QT_ que não têm código
+# especial nenhum e ainda assim são contagens.
 PREFIXOS_CONTINUOS      = {"QT"}
 NOMES_CONTINUOS         = {"LATITUDE", "LONGITUDE"}
 # Prefixos que indicam código/identificador administrativo (sem valor
@@ -124,7 +131,12 @@ def determinar_sum_stats_options(var: dict) -> dict:
 
     tipo = var["tipo"]
     nome = var["nome_variavel"]
-    tem_categoria = bool(var["rotulos_valor"])
+    # Só categorias REAIS contam. Um código de imputação ou de não-resposta
+    # não torna a variável categórica: as 2 variáveis de CNPJ têm como única
+    # "categoria" o 99999999999999 de "Sem declaração", e pediam uma tabela de
+    # frequência de 200 mil CNPJs distintos.
+    categorias_reais, _ = separar_codigos_especiais(var["rotulos_valor"])
+    tem_categoria = bool(categorias_reais)
     m = PREFIXO_RE.match(nome)
     prefixo = m.group(1) if m else ""
 
@@ -242,11 +254,17 @@ def ler_aba(ws) -> dict:
             "notas_importantes":              notas_importantes or None,
         })
 
-    return {"titulo": titulo, "variaveis": variaveis}
+    # Ano do dicionário = última coluna de "Coleta por ano". É a edição que a
+    # planilha descreve, e é dele que dependem o universo (`var_universe`) e o
+    # critério de descontinuidade — por isso sai daqui, da própria planilha, e
+    # não do ano detectado pelos nomes dos arquivos, que pode divergir.
+    ano_dicionario = colunas_ano[-1][1] if colunas_ano else None
+
+    return {"titulo": titulo, "variaveis": variaveis, "ano_dicionario": ano_dicionario}
 
 
 def ler_dicionario(caminho_xlsx: Path) -> dict:
-    """Lê o dicionário .xlsx e devolve {tabela: {titulo, variaveis}}.
+    """Lê o dicionário .xlsx e devolve {tabela: {titulo, variaveis, ano_dicionario}}.
 
     As abas são casadas de forma tolerante (ver censo_lib.identificar_tabela):
     ignora ano, acento, caixa e separadores, de modo que um dicionário novo com
@@ -306,6 +324,22 @@ def _anos_coletados(var: dict) -> str:
     return f"Coletado em: {anos_sim[0]}–{anos_sim[-1]}"
 
 
+def nota_descontinuada(var: dict, ano_dicionario: str | None) -> str:
+    """Flag de descontinuidade da variável no ano da edição, ou "".
+
+    Critério decidido em reunião: a coluna do ano do dicionário na matriz
+    "Coleta por ano" marcada com "n" significa variável descontinuada naquele
+    ano. É deliberadamente literal — inclui as variáveis que aparecem com "n"
+    em todos os anos (na edição 2025, os 9 campos de endereço da tabela Escola,
+    que nunca chegaram a ser publicados).
+    """
+    if not ano_dicionario:
+        return ""
+    if (var.get("anos_coleta") or {}).get(ano_dicionario) != "n":
+        return ""
+    return f"Variável descontinuada no ano de {ano_dicionario}."
+
+
 def montar_variavel(
     var: dict,
     indice: int,
@@ -314,6 +348,7 @@ def montar_variavel(
     conceito: dict | None = None,
     conceito_concept: dict | None = None,
     universo: str = "",
+    ano_dicionario: str | None = None,
 ) -> dict:
     var_format = montar_var_format(var)
     # Largura declarada segue o dicionário para todos os tipos — antes as
@@ -322,27 +357,59 @@ def montar_variavel(
     loc_width = largura_variavel(var)
     sid = fid.replace("F", "")
 
+    # O rótulo de TODO código é preservado, inclusive o dos especiais: quem
+    # abrir o metadado precisa saber o que 88888 significa. O que muda é que os
+    # especiais são também declarados como valores inválidos logo abaixo.
     categorias = [
         {"value": str(codigo), "labl": texto}
         for codigo, texto in sorted(var["rotulos_valor"].items())
     ]
+
+    # Valores que não são observação: código de tratamento de consistência do
+    # produtor ("imputacao") ou de ausência de declaração ("nao_resposta").
+    # Vão para var_invalrng para que média, desvio e frequência não os tratem
+    # como quantidade — 88888 entrando numa média de "quantidade de televisões"
+    # é a diferença entre 3,4 e 4.317,0.
+    _, especiais = separar_codigos_especiais(var["rotulos_valor"])
+    valores_invalidos = [str(codigo) for codigo in sorted(especiais)]
+    # DDI: `imputation` descreve o PROCEDIMENTO, em texto livre. TODOS os
+    # códigos especiais entram — a decisão registrada em reunião é tratar o
+    # valor especial como resultado do processamento do INEP, não só o de valor
+    # extremo. A natureza de cada um fica explícita no texto (ver
+    # censo_lib.descrever_imputacao).
+    texto_imputacao = descrever_imputacao(especiais)
 
     # Conceitos/orientações do Caderno, já estruturados e alinhados por
     # variável (ver censo_lib.obter_metadados_caderno). Preservam o dado do
     # dicionário quando o Caderno não traz definição correspondente.
     conceito = conceito or {}
     var_txt = conceito.get("var_txt") or var["descricao"]
-    var_notes = var.get("notas_importantes") or ""
-    nota_caderno = conceito.get("var_notes")
-    if nota_caderno:
-        var_notes = f"{var_notes}\n{nota_caderno}".strip() if var_notes else nota_caderno
 
-    # Anos de coleta descrevem o PERÍODO, não a população — por isso saíram
-    # de var_universe (que agora recebe o universo da tabela) e vieram para
-    # as notas.
-    anos = _anos_coletados(var)
-    if anos:
-        var_notes = f"{var_notes}\n{anos}".strip() if var_notes else anos
+    # Cada campo de texto tem UMA fonte, decidida em reunião:
+    #
+    #   var_notes          ("Notas sobre as variáveis")   <- dicionário
+    #   var_qstn_ivuinstr  ("Instruções para o entrevistador") <- Caderno
+    #
+    # Os destaques "Importante!"/"Você sabia?" do Caderno são endereçados a
+    # quem PREENCHE o Educacenso ("as secretarias devem ter atenção no
+    # preenchimento..."), não a quem analisa os microdados: são instrução de
+    # coleta, e por isso saíram de var_notes para var_qstn_ivuinstr, junto das
+    # orientações de preenchimento que já iam nesse campo.
+    partes_notes = [
+        var.get("notas_importantes") or "",
+        # Anos de coleta descrevem o PERÍODO, não a população — por isso não
+        # ficam em var_universe.
+        _anos_coletados(var),
+        # Descontinuidade no ano da edição (ver `nota_descontinuada`).
+        nota_descontinuada(var, ano_dicionario),
+    ]
+    var_notes = "\n".join(p for p in partes_notes if p).strip()
+
+    partes_ivuinstr = [
+        conceito.get("var_qstn_ivuinstr") or "",
+        conceito.get("var_destaque") or "",
+    ]
+    var_qstn_ivuinstr = "\n".join(p for p in partes_ivuinstr if p).strip()
 
     # Conceito casado a partir da mesma estrutura que alimenta o censo.html
     # (ver censo_lib.mapear_conceitos_para_concept). Guarda o TÍTULO do
@@ -369,7 +436,7 @@ def montar_variavel(
         "sort_order":           str(indice - 1),
         "var_intrvl":           intervalo,
         "loc_width":            loc_width,
-        "var_invalrng":         {"values": []},
+        "var_invalrng":         {"values": valores_invalidos},
         "var_valrng":           {"range": {"UNITS": "REAL", "count": 0, "min": "", "max": ""}},
         "var_sumstat":          [],
         "var_catgry":           [],
@@ -391,18 +458,33 @@ def montar_variavel(
         "var_qstn_postqtxt":    "",
         "var_forward":          "",
         "var_backward":         "",
-        "var_qstn_ivuinstr":    conceito.get("var_qstn_ivuinstr", ""),
+        "var_qstn_ivuinstr":    var_qstn_ivuinstr,
         "var_codinstr":         "",
-        "var_imputation":       "",
+        "var_imputation":       texto_imputacao,
         "var_derivation":       "",
     }
 
 
-def montar_datafile(nome_arquivo: str, titulo: str, total_variaveis: int, fid: str) -> dict:
+def montar_datafile(
+    nome_arquivo: str, titulo: str, total_variaveis: int, fid: str, ano=None
+) -> dict:
+    """Cabeçalho `datafile` do JSON de importação.
+
+    `file_name` DECLARA o nome do arquivo de dados a que este metadado se
+    refere — é por ele que o Metadata Editor amarra o JSON ao .sav. O ETL não
+    gera mais o .sav, mas o campo continua sendo a referência correta: é o
+    nome que o arquivo tem na convenção do INEP, e é daqui que os scripts
+    standalone criar_sav_vazio/popular_sav o leem
+    (censo_lib.nome_sav_do_json) em vez de recalcular. Antes este campo dizia
+    "gestor.sav" enquanto o arquivo gravado era "Tabela_Gestor.sav".
+
+    `case_count` nasce 0 e assim permanece na saída do serviço, que não lê os
+    microdados; popular_sav o regrava quando usado standalone.
+    """
     return {
         "file_id":    fid,
         "fid":        fid,
-        "file_name":  f"{nome_arquivo}.sav",
+        "file_name":  nome_saida_sav(nome_arquivo, ano),
         "labl":       titulo,
         "var_count":  total_variaveis,
         "case_count": 0,
@@ -417,6 +499,8 @@ def gerar_json_importacao(
     questao_por_variavel: dict[str, str] | None = None,
     conceitos_por_variavel: dict[str, dict] | None = None,
     concept_por_variavel: dict[str, dict] | None = None,
+    ano=None,
+    ano_dicionario: str | None = None,
 ) -> Path:
     """Monta e grava o JSON de importação de uma tabela.
 
@@ -429,7 +513,9 @@ def gerar_json_importacao(
     questao_por_variavel = questao_por_variavel or {}
     conceitos_por_variavel = conceitos_por_variavel or {}
     concept_por_variavel = concept_por_variavel or {}
-    universo = UNIVERSO_POR_TABELA.get(nome_arquivo, "")
+    # Universo ancorado no ano do DICIONÁRIO, não no ano detectado para nomear
+    # a saída: é a planilha que define de que edição são as variáveis descritas.
+    universo = universo_publicacao(ano_dicionario or ano)
 
     vars_montadas = [
         montar_variavel(
@@ -438,22 +524,25 @@ def gerar_json_importacao(
             conceitos_por_variavel.get(v["nome_variavel"]),
             concept_por_variavel.get(v["nome_variavel"]),
             universo,
+            ano_dicionario,
         )
         for i, v in enumerate(variaveis)
     ]
 
     payload = {
-        "datafile":  montar_datafile(nome_arquivo, titulo, len(variaveis), fid),
+        "datafile":  montar_datafile(nome_arquivo, titulo, len(variaveis), fid, ano),
         "variables": vars_montadas,
     }
     pasta_saida.mkdir(parents=True, exist_ok=True)
-    caminho = pasta_saida / f"{nome_arquivo}_import_metadata_editor.json"
+    caminho = pasta_saida / nome_saida_json(nome_arquivo, ano)
     with open(caminho, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
     return caminho
 
 
-def gravar_relatorio_casamento(linhas: list[dict], pasta_saida: Path) -> Path | None:
+def gravar_relatorio_casamento(
+    linhas: list[dict], pasta_saida: Path, ano=None
+) -> Path | None:
     """Grava o CSV de auditoria dos casamentos heurísticos.
 
     Boa parte dos metadados semânticos (var_concept, var_qstn_qstnlit,
@@ -461,12 +550,17 @@ def gravar_relatorio_casamento(linhas: list[dict], pasta_saida: Path) -> Path | 
     contagens agregadas. Este arquivo permite a um especialista conferir
     variável a variável o que foi atribuído e com que pontuação — a revisão
     que este tipo de produto exige antes de publicar.
+
+    `valores_especiais` lista os códigos que saíram de categoria e viraram
+    valor inválido (`88888=imputacao`), para que essa reclassificação seja
+    conferível na mesma planilha — ela muda como as estatísticas do Metadata
+    Editor leem a variável.
     """
     if not linhas:
         return None
     colunas = ["tabela", "variavel", "descricao", "conceito", "tem_var_txt",
-               "questao", "score_questao"]
-    caminho = pasta_saida / "relatorio_casamento.csv"
+               "questao", "score_questao", "valores_especiais"]
+    caminho = pasta_saida / f"{prefixo_edicao(ano)}relatorio_casamento.csv"
     try:
         # utf-8-sig: o Excel em pt-BR abre o CSV com acentuação correta.
         with open(caminho, "w", encoding="utf-8-sig", newline="") as fh:
@@ -517,7 +611,12 @@ def montar_dicionario_html(tabelas: dict[str, dict]) -> list[dict]:
                     "tipo":       v["tipo"],
                     "tamanho":    v["tamanho"],
                     "universo":   _anos_coletados(v),
-                    "notas":      v.get("notas_importantes") or "",
+                    "notas":      "\n".join(
+                        t for t in (
+                            v.get("notas_importantes") or "",
+                            nota_descontinuada(v, info.get("ano_dicionario")),
+                        ) if t
+                    ),
                     "categorias": [
                         {"valor": str(codigo), "rotulo": texto}
                         for codigo, texto in sorted(v["rotulos_valor"].items())
@@ -539,10 +638,25 @@ def executar(
     gerar_html: bool = True,
     incluir_questionarios: bool = True,
     tabelas_alvo: list[str] | None = None,
+    ano: str | int | None = None,
 ) -> None:
     if not caminho_xlsx.exists():
         sys.exit(f'Arquivo não encontrado: "{caminho_xlsx}"')
     print(f'Lendo dicionário: "{caminho_xlsx}"')
+
+    # A saída é nomeada pela convenção do INEP (ceb2025_microdados_tabela_*).
+    # Sem `ano` informado pelo chamador, tenta deduzi-lo dos nomes dos insumos
+    # — no pipeline completo quem detecta é o app, que tem acesso aos CSVs e
+    # portanto à coluna NU_ANO_CENSO. Ver censo_lib §5 e `detectar_ano_censo`.
+    if ano is None:
+        ano = detectar_ano_censo(
+            nomes_extra=[caminho_xlsx, caminho_caderno, pasta_questionarios]
+        )
+    if ano:
+        print(f"  Edição detectada: {ano} — saída como {prefixo_edicao(ano)}microdados_tabela_*")
+    else:
+        print("  [aviso] Ano da edição não determinado; a saída sai sem ano "
+              f"({prefixo_edicao(None)}microdados_tabela_*).")
 
     # O dicionário é sempre lido por inteiro: ele é uma das fontes do
     # censo.html e a base do alinhamento com o Caderno (cache estável,
@@ -666,12 +780,13 @@ def executar(
         print("Gerando censo.html (dicionário + Caderno de Conceitos + questionários)...")
         try:
             caminho_censo_html = gerar_censo_html(
-                conceitos_html, quadros_html, pasta_saida / "censo.html",
+                conceitos_html, quadros_html,
+                pasta_saida / f"{prefixo_edicao(ano)}censo.html",
                 questionarios_html, dicionario=dicionario_html,
             )
             n_vars_html = sum(len(t["variaveis"]) for t in dicionario_html)
             print(
-                f"  OK: censo.html ({len(conceitos_html)} conceitos, {len(quadros_html)} quadros, "
+                f"  OK: {caminho_censo_html.name} ({len(conceitos_html)} conceitos, {len(quadros_html)} quadros, "
                 f"{len(questionarios_html)} questionário(s), "
                 f"{n_vars_html} variáveis em {len(dicionario_html)} tabela(s)) -> {caminho_censo_html}"
             )
@@ -706,13 +821,15 @@ def executar(
         concept_tabela = mapa_concept.get(nome_arquivo, {})
         caminho = gerar_json_importacao(
             nome_arquivo, info["titulo"], info["variaveis"], pasta_saida,
-            questao_por_variavel, conceitos_tabela, concept_tabela,
+            questao_por_variavel, conceitos_tabela, concept_tabela, ano,
+            info.get("ano_dicionario"),
         )
 
         for v in info["variaveis"]:
             nome_var = v["nome_variavel"]
             texto_q, score_q = casamento[nome_var]
             conceito_casado = concept_tabela.get(nome_var) or {}
+            _, especiais_var = separar_codigos_especiais(v["rotulos_valor"])
             linhas_relatorio.append({
                 "tabela":          nome_arquivo,
                 "variavel":        nome_var,
@@ -721,7 +838,28 @@ def executar(
                 "tem_var_txt":     "sim" if conceitos_tabela.get(nome_var, {}).get("var_txt") else "",
                 "questao":         texto_q,
                 "score_questao":   f"{score_q:.3f}" if texto_q else "",
+                "valores_especiais": " ".join(
+                    f"{cod}={tipo}" for cod, (tipo, _) in sorted(especiais_var.items())
+                ),
             })
+
+        # Valores especiais: quantos códigos deixaram de ser categoria e
+        # viraram valor inválido, e — o que mais importa — quais tinham cara
+        # de sentinela e NÃO foram reconhecidos pelo rótulo. Este segundo caso
+        # é o sinal de que o INEP mudou a redação e a regra precisa de
+        # ajuste; sem o aviso, o código passaria como categoria real.
+        n_imput = n_naoresp = 0
+        nao_reconhecidos: list[str] = []
+        for v in info["variaveis"]:
+            reais_v, especiais_v = separar_codigos_especiais(v["rotulos_valor"])
+            for _, (tipo_v, _rot) in especiais_v.items():
+                if tipo_v == "imputacao":
+                    n_imput += 1
+                else:
+                    n_naoresp += 1
+            for cod_v, rot_v in reais_v.items():
+                if parece_sentinela(cod_v):
+                    nao_reconhecidos.append(f"{v['nome_variavel']}:{cod_v}=“{rot_v[:60]}”")
 
         match_info = f", {n_com_match}/{n_vars} vars com questão" if n_questoes else ""
         conceito_info = f", {len(conceitos_tabela)}/{n_vars} vars com conceito" if conceitos_tabela else ""
@@ -741,8 +879,20 @@ def executar(
         if not concept_tabela:
             print(f"    [AVISO] {rotulo}: nenhum conceito do Caderno casou — "
                   f"var_concept ficará vazio nas {n_vars} variáveis.")
+        if n_imput or n_naoresp:
+            print(f"    Valores especiais: {n_imput + n_naoresp} código(s) em "
+                  f"var_invalrng + var_imputation "
+                  f"({n_imput} de tratamento de consistência, "
+                  f"{n_naoresp} de não-resposta).")
+        if nao_reconhecidos:
+            print(f"    [AVISO] {rotulo}: {len(nao_reconhecidos)} código(s) com "
+                  f"forma de sentinela seguem valendo como CATEGORIA REAL porque "
+                  f"o rótulo não casou com nenhum marcador conhecido — confira e, "
+                  f"se for o caso, estenda censo_lib._MARCADORES_*: "
+                  + "; ".join(nao_reconhecidos[:5])
+                  + (f" (+{len(nao_reconhecidos) - 5})" if len(nao_reconhecidos) > 5 else ""))
 
-    caminho_relatorio = gravar_relatorio_casamento(linhas_relatorio, pasta_saida)
+    caminho_relatorio = gravar_relatorio_casamento(linhas_relatorio, pasta_saida, ano)
     if caminho_relatorio:
         print(f"  Relatório de casamento: {caminho_relatorio.name} "
               f"({len(linhas_relatorio)} linhas) — revise antes de publicar.")

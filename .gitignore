@@ -18,10 +18,13 @@ desnecessario/
 # ---------------------------------------------------------------------------
 # Artefatos gerados pelo pipeline
 # ---------------------------------------------------------------------------
+# Os artefatos por tabela saem na convenção do INEP
+# (ceb2025_microdados_tabela_escola.sav) e os demais levam o prefixo da
+# edição (ceb2025_censo.html) — daí os curingas.
 *.sav
 *.zip
-censo.html
-relatorio_casamento.csv
+*censo.html
+*relatorio_casamento.csv
 *_import_metadata_editor.json
 caderno_conceitos_metadados.json
 censo_html_dados.json
@@ -35,3 +38,23 @@ saida_censo_escolar/
 # ---------------------------------------------------------------------------
 .streamlit/secrets.toml
 .env
+
+# ---------------------------------------------------------------------------
+# Insumos de exemplo
+# ---------------------------------------------------------------------------
+# Pacotes do INEP guardados como exemplo de formato de entrada. São centenas de
+# MB; o comportamento que eles exercitam está fixado em testar_identificacao.py,
+# que roda só com nomes e não precisa dos arquivos.
+exemplo_input/
+
+# ---------------------------------------------------------------------------
+# Notas de trabalho e documentos avulsos
+# ---------------------------------------------------------------------------
+# Mesma regra que tirou RECOMMENDATION*.md do repositório: material de reunião
+# e apresentação envelhece a cada edição e não é necessário para rodar o app.
+# O que vale fica em DOCUMENTACAO.md e README.md.
+ALTERACOES.md
+*.pdf
+
+# Reprodução de bug guardada localmente (o .sav já cai no curinga acima).
+bug_dataverse_segmentos/

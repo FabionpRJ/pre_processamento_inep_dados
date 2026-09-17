@@ -35,7 +35,7 @@ def gerar_censo_html(
     questionarios: list[dict] | None = None,
     titulo: str = "Caderno de Conceitos — Censo Escolar 2025",
     dicionario: list[dict] | None = None,
-) -> str:
+) -> Path:
     """Monta o censo.html injetando os dados no template e grava em saida_path.
 
     Reúne as três fontes de metadados do pipeline: `conceitos`/`quadros` (do
@@ -47,6 +47,11 @@ def gerar_censo_html(
     gerado quando a lista vem vazia.
     `titulo` é aceito por compatibilidade de assinatura; o template golden
     tem o título fixo no shell HTML (não é substituído aqui).
+
+    Devolve o `Path` gravado. Devolvia `str`, e quem chama usa `.name` para
+    logar o resultado: o `AttributeError` era engolido pelo `except` do
+    chamador e virava "[aviso] Não foi possível gerar censo.html" — sobre um
+    arquivo que tinha acabado de ser gravado com sucesso.
     """
     if not TEMPLATE_PATH.is_file():
         raise FileNotFoundError(f"Template não encontrado: {TEMPLATE_PATH}")
@@ -70,4 +75,4 @@ def gerar_censo_html(
     saida_path.parent.mkdir(parents=True, exist_ok=True)
     saida_path.write_text(html, encoding="utf-8")
 
-    return str(saida_path)
+    return saida_path
