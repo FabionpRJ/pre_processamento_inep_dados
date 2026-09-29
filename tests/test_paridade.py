@@ -9,13 +9,13 @@ import logging
 import shutil
 
 import pytest
-from comparacao import comparar
-from conftest import INSUMOS, RAIZ
 
 from censo_etl.edicao import detectar_ano_em_cascata
 from censo_etl.insumos import localizar_insumos
 from censo_etl.logs import registrar_saida, remover_saida
 from censo_etl.pipeline import gerar_metadados
+from comparacao import comparar
+from conftest import INSUMOS, RAIZ
 
 REFERENCIA = RAIZ / "OUTROS" / "referencia" / "saida"
 

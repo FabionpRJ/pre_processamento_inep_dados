@@ -30,8 +30,8 @@ caderno_conceitos_metadados.json
 censo_html_dados.json
 
 # pastas de saída usadas em execução standalone
-sav/
-saida_censo_escolar/
+/sav/
+/saida_censo_escolar/
 
 # ---------------------------------------------------------------------------
 # Configuração local

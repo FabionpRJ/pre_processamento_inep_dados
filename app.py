@@ -1,638 +1,412 @@
-#!/usr/bin/env python3
-"""app.py — Interface Streamlit para o gerador de metadados do Censo Escolar."""
-import io
+"""Interface Streamlit do gerador de metadados do Censo Escolar.
+
+    streamlit run app.py
+
+Só desenha e coleta: a lógica está em `censo_etl` (pipeline, insumos e servico).
+"""
+from __future__ import annotations
+
+import logging
 import sys
 import tempfile
 import time
 import traceback
-import zipfile
-from contextlib import redirect_stdout
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import streamlit as st
 
-# Garante que os módulos do projeto sejam importáveis ao rodar de outro diretório
-PROJECT_DIR = Path(__file__).parent
-if str(PROJECT_DIR) not in sys.path:
-    sys.path.insert(0, str(PROJECT_DIR))
+# Permite `streamlit run` a partir de outro diretório.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from censo_lib import (
-    ROTULO_TABELA,
-    classificar_nomes, detectar_ano_censo, localizar_insumos, prefixo_edicao,
-    tabelas_do_dicionario,
+from censo_etl.dicionario import tabelas_do_dicionario
+from censo_etl.edicao import detectar_ano_em_cascata, prefixo_edicao
+from censo_etl.erros import EntradaInvalida
+from censo_etl.insumos import (
+    NomesClassificados,
+    extrair_insumos_zip,
+    inspecionar_zip,
+    ler_membro_zip,
+    localizar_insumos,
 )
+from censo_etl.logs import registrar_saida, remover_saida
+from censo_etl.pipeline import gerar_metadados
+from censo_etl.servico import (
+    NOME_PACOTE,
+    ResultadoApp,
+    assinatura,
+    avisos_de_lacunas,
+    empacotar,
+    explicar_erro,
+    mensagem_sucesso,
+)
+from censo_etl.tabelas import rotulo
 
-MODO_ZIP      = "ZIP oficial do INEP"
+MODO_ZIP = "ZIP oficial do INEP"
 MODO_ARQUIVOS = "Arquivos separados"
+LOG_MAX = 50                                     # linhas visíveis na janela de log
+P_ENTRADAS, P_METADADOS, P_EMPACOTE = 10, 90, 95  # faixas da barra de progresso
 
-# Extensões dos insumos de metadados. Só elas saem do zip: os CSVs de
-# microdados não são lidos pelo pipeline (ver `extrair_insumos_zip`).
-EXT_INSUMOS = (".xlsx", ".xls", ".pdf")
 
-LOG_MAX = 50  # linhas mantidas visíveis na janela de log
+@dataclass
+class Entradas:
+    """O que o usuário enviou, em qualquer dos dois modos."""
+    modo: str
+    uploads: list = field(default_factory=list)          # para a assinatura
+    dicionario_bytes: bytes | None = None
+    zip: object | None = None
+    zip_info: NomesClassificados | None = None
+    dicionario: object | None = None
+    caderno: object | None = None
+    questionarios: list = field(default_factory=list)
+    usar_caderno: bool = True
+    usar_questionarios: bool = True
 
-# Faixas da barra de progresso. A geração dos metadados é praticamente todo o
-# trabalho — leitura do dicionário, dos PDFs e o casamento por similaridade.
-P_ENTRADAS, P_PASSO1, P_EMPACOTE = 10, 90, 95
+    @property
+    def tem_caderno(self) -> bool:
+        """O insumo foi pedido E existe (no zip, é o que a varredura achou)."""
+        if self.modo == MODO_ZIP:
+            return bool(self.zip_info and self.zip_info.caderno)
+        return self.usar_caderno and self.caderno is not None
+
+    @property
+    def tem_questionarios(self) -> bool:
+        if self.modo == MODO_ZIP:
+            return bool(self.zip_info and self.zip_info.questionarios)
+        return self.usar_questionarios and bool(self.questionarios)
+
+
+@dataclass
+class Opcoes:
+    tabelas: list[str]
+    gerar_html: bool
+    incluir_questionarios: bool
+
 
 # ---------------------------------------------------------------------------
-# Configuração da página
+# Entradas
 # ---------------------------------------------------------------------------
-st.set_page_config(
-    page_title="Censo Escolar — Gerador de metadados",
-    page_icon="📊",
-    layout="centered",
-)
 
-st.title("Censo Escolar — Gerador de metadados")
-st.markdown(
-    "Gera os `.json` de importação do **World Bank Metadata Editor**, o "
-    "`censo.html` navegável e o relatório de casamento. **O único insumo "
-    "obrigatório é o dicionário de variáveis** — os microdados não são lidos."
-)
+def coletar_entradas() -> Entradas:
+    modo = st.radio(
+        "Forma de envio dos insumos", [MODO_ZIP, MODO_ARQUIVOS], horizontal=True,
+        help="O ZIP oficial traz tudo junto (os CSVs de microdados são ignorados). O modo por "
+             "arquivos permite combinar insumos de origens/anos diferentes — por exemplo, um "
+             "dicionário novo com o Caderno e os questionários já em mãos.",
+    )
+    st.caption(f"Limite de upload por arquivo: **{st.get_option('server.maxUploadSize')} MB**.")
+    return _entradas_zip() if modo == MODO_ZIP else _entradas_arquivos()
+
+
+def _entradas_zip() -> Entradas:
+    arquivo = st.file_uploader(
+        "Arquivo .zip dos microdados", type="zip",
+        help="Arquivo baixado do site do INEP — a estrutura interna de pastas não importa; os "
+             "insumos são localizados pelos próprios arquivos. Só o dicionário, o Caderno e os "
+             "questionários são extraídos.",
+    )
+    entradas = Entradas(MODO_ZIP, uploads=[arquivo], zip=arquivo)
+    if arquivo is None:
+        return entradas
+    info = inspecionar_zip(arquivo)
+    if info is None:
+        st.error("O .zip não pôde ser lido — arquivo corrompido ou incompleto.")
+        st.stop()
+    if not info.dicionario:
+        st.error("Nenhum dicionário encontrado dentro do zip. É esperado um `.xlsx` com "
+                 "'dicionário' no nome — ou, na falta dele, um único `.xlsx` no pacote.")
+        st.stop()
+    entradas.zip_info = info
+    entradas.dicionario_bytes = ler_membro_zip(arquivo, info.dicionario)
+    with st.expander("Conteúdo identificado no zip", expanded=False):
+        linhas = [
+            f"- **Dicionário:** `{Path(info.dicionario).name}`",
+            "- **Caderno de Conceitos:** "
+            + (f"`{Path(info.caderno).name}`" if info.caderno else "_não encontrado_"),
+            f"- **Questionários:** {len(info.questionarios)} PDF(s)",
+        ]
+        if info.csvs:
+            linhas.append(f"- **CSVs de microdados:** {len(info.csvs)} — **ignorados**, "
+                          "o pipeline não lê os dados.")
+        st.markdown("\n".join(linhas))
+    return entradas
+
+
+def _entradas_arquivos() -> Entradas:
+    st.subheader("Insumo obrigatório")
+    dicionario = st.file_uploader(
+        "1. Dicionário de variáveis (.xlsx)", type="xlsx",
+        help="Planilha com uma aba por tabela (Tabela_de_Escola, Tabela_de_Matrícula, …). Fonte "
+             "dos nomes, tipos, rótulos e categorias das variáveis, e a única entrada obrigatória.",
+    )
+    st.subheader("Metadados opcionais")
+    usar_caderno = st.checkbox(
+        "Incluir Caderno de Conceitos", value=True,
+        help="Preenche `var_concept` (conceitos e definições) e alimenta o glossário e os quadros "
+             "de referência do censo.html. Sem ele o pipeline roda, mas esses campos ficam vazios.",
+    )
+    caderno = st.file_uploader(
+        "2. Caderno de Conceitos e Orientações (.pdf)", type="pdf",
+        help="Fonte dos conceitos (var_concept), definições e quadros de referência.",
+    ) if usar_caderno else None
+    usar_questionarios = st.checkbox(
+        "Incluir questionários", value=True,
+        help="Preenche `var_qstn_qstnlit` (pergunta literal de cada variável). Sem eles o "
+             "pipeline roda, mas esse campo fica vazio.",
+    )
+    questionarios = (st.file_uploader(
+        "3. Questionários (.pdf)", type="pdf", accept_multiple_files=True,
+        help="PDFs no padrão '<Nome> <ano>.pdf' (Escola, Aluno, Turma, Gestor Escolar, "
+             "Profissional Escolar). Fonte das questões literais (var_qstn_qstnlit).",
+    ) or []) if usar_questionarios else []
+    return Entradas(
+        MODO_ARQUIVOS, uploads=[dicionario, caderno, *questionarios],
+        dicionario_bytes=bytes(dicionario.getbuffer()) if dicionario else None,
+        dicionario=dicionario, caderno=caderno, questionarios=questionarios,
+        usar_caderno=usar_caderno, usar_questionarios=usar_questionarios,
+    )
+
 
 # ---------------------------------------------------------------------------
-# Estado da sessão
+# Tabelas e opções
 # ---------------------------------------------------------------------------
-st.session_state.setdefault("resultado_zip", None)
-st.session_state.setdefault("assinatura_processada", None)
-st.session_state.setdefault("avisos", [])       # falhas parciais do último run
-st.session_state.setdefault("duracao", None)    # segundos do último run
+
+def escolher_tabelas(dicionario_bytes: bytes) -> list[str]:
+    """Multiselect alimentado pelas abas do dicionário."""
+    opcoes = tabelas_do_dicionario(dicionario_bytes)
+    if not opcoes:
+        st.error("Nenhuma aba do arquivo foi reconhecida como tabela do Censo. Confira se o `.xlsx` "
+                 "enviado é mesmo o Dicionário de Variáveis do INEP (abas no padrão "
+                 "`Tabela_de_Escola`, `Tabela_de_Matrícula`, …).")
+        st.stop()
+    # A seleção vive em session_state para os botões poderem alterá-la; outro
+    # dicionário pode trazer outras abas, então ela é filtrada.
+    if "tabelas" not in st.session_state:
+        st.session_state.tabelas = list(opcoes)
+    elif (validas := [t for t in st.session_state.tabelas if t in opcoes]) != list(st.session_state.tabelas):
+        st.session_state.tabelas = validas
+
+    st.subheader("Tabelas a processar")
+    todas, limpar, _ = st.columns([1, 1, 2])
+    if todas.button("Selecionar todas", width="stretch"):
+        st.session_state.tabelas = list(opcoes)
+        st.rerun()
+    if limpar.button("Limpar seleção", width="stretch"):
+        st.session_state.tabelas = []
+        st.rerun()
+    return st.multiselect(
+        "Tabelas a processar", options=opcoes, key="tabelas", label_visibility="collapsed",
+        format_func=rotulo,
+        help="Um JSON de importação por tabela marcada. O dicionário é lido por inteiro de "
+             "qualquer forma — o recorte afeta só os JSONs gerados.",
+    )
 
 
-def assinatura(uploads: list, opcoes: tuple) -> tuple:
-    """Identidade da execução (arquivos + opções), para invalidar o resultado."""
-    return (tuple(sorted((u.name, u.size) for u in uploads if u is not None)), opcoes)
+def escolher_opcoes(entradas: Entradas, tabelas: list[str]) -> Opcoes:
+    st.subheader("Opções de saída")
+    gerar_html = st.checkbox(
+        "Gerar censo.html (dicionário + Caderno de Conceitos + questionários)", value=True,
+        help="Arquivo HTML autocontido com o dicionário de variáveis das tabelas processadas, o "
+             "glossário de conceitos e os quadros de referência do Censo.",
+    )
+    incluir = st.checkbox(
+        "Incluir questionários (PDF) no censo.html", value=True,
+        disabled=not (gerar_html and entradas.tem_questionarios),
+        help="Adiciona uma aba com as perguntas numeradas extraídas dos questionários em PDF."
+             if entradas.tem_questionarios else "Indisponível: nenhum questionário foi fornecido.",
+    )
+    # Sem questionário não há aba a gerar: travar evita que o painel de
+    # cobertura discorde do censo.html produzido.
+    return Opcoes(tabelas, gerar_html, bool(incluir and gerar_html and entradas.tem_questionarios))
 
 
-def gravar_upload(upload, destino: Path) -> Path:
-    """Materializa um upload em disco preservando o nome original.
-
-    O nome importa: a identificação de questionário é feita pelo nome do
-    arquivo (ver censo_lib.localizar_questionario), e o ano da edição é
-    deduzido dos nomes dos insumos.
-    """
-    destino.mkdir(parents=True, exist_ok=True)
-    caminho = destino / Path(upload.name).name
-    caminho.write_bytes(upload.getbuffer())
-    return caminho
-
-
-def explicar_erro(exc: BaseException) -> str:
-    """Traduz falhas conhecidas em orientação acionável.
-
-    Sem isso o usuário via só a mensagem crua da exceção (ex: `KeyError:
-    'Tabela_de_Escola'`), que não diz o que corrigir.
-    """
-    if isinstance(exc, SystemExit):
-        # Os módulos do pipeline sinalizam entrada inválida com sys.exit(msg).
-        return str(exc.code) if exc.code not in (None, 0) else "Passo interrompido."
-    if isinstance(exc, zipfile.BadZipFile):
-        return ("O arquivo .zip está corrompido ou veio incompleto. Baixe de novo "
-                "no site do INEP e refaça o upload.")
-    if isinstance(exc, KeyError):
-        return (f"Campo esperado ausente: {exc}. Verifique se o dicionário é de "
-                "uma edição reconhecida do Censo.")
-    if isinstance(exc, UnicodeDecodeError):
-        return ("Não foi possível ler o texto de um arquivo (codificação não "
-                "reconhecida).")
-    if isinstance(exc, MemoryError):
-        return ("Memória insuficiente. Processe menos tabelas por vez — "
-                "matrícula e docente são as maiores.")
-    if isinstance(exc, FileNotFoundError):
-        return f"Arquivo esperado não encontrado: {exc.filename or exc}"
-    if isinstance(exc, PermissionError):
-        return f"Sem permissão de acesso ao arquivo: {exc.filename or exc}"
-    return f"{type(exc).__name__}: {exc}"
-
-
-def inspecionar_zip(upload) -> dict | None:
-    """Prevê, só pelos nomes dentro do zip, o que o pipeline vai encontrar.
-
-    Lê apenas o índice central do zip — não extrai nada. Os critérios são os
-    mesmos usados na extração mais abaixo, para o painel de cobertura nunca
-    discordar do resultado real. Devolve None se o zip estiver ilegível.
-    """
-    try:
-        with zipfile.ZipFile(upload) as zf:
-            nomes = zf.namelist()
-    except zipfile.BadZipFile:
-        return None
-    finally:
-        upload.seek(0)
-
-    # Mesma função que a extração real usa (censo_lib.classificar_nomes), para
-    # que a prévia não possa discordar do resultado.
-    return classificar_nomes(nomes)
-
-
-def ler_membro_zip(upload, nome: str) -> bytes | None:
-    """Lê um único arquivo de dentro do zip, sem extrair o resto.
-
-    Serve para abrir o dicionário e descobrir quais tabelas ele traz antes de
-    qualquer processamento — o `.xlsx` tem alguns MB, enquanto o pacote
-    inteiro tem vários GB de microdados.
-    """
-    try:
-        with zipfile.ZipFile(upload) as zf:
-            return zf.read(nome)
-    except (zipfile.BadZipFile, KeyError):
-        return None
-    finally:
-        upload.seek(0)
-
-
-def extrair_insumos_zip(upload, destino: Path) -> None:
-    """Extrai do zip apenas os insumos de metadados (`.xlsx`/`.xls`/`.pdf`).
-
-    Os CSVs de microdados ficam no arquivo: o pipeline não lê mais os dados,
-    e extrair tudo custaria dezenas de minutos e vários GB de disco temporário
-    para produzir exatamente os mesmos metadados.
-    """
-    with zipfile.ZipFile(upload) as zf:
-        for info in zf.infolist():
-            if info.is_dir():
-                continue
-            if Path(info.filename).suffix.lower() in EXT_INSUMOS:
-                zf.extract(info, destino)
-    upload.seek(0)
-
-
-def painel_cobertura(tem_caderno: bool, tem_questionarios: bool) -> None:
-    """Mostra, ANTES de processar, quais metadados a seleção atual preenche.
-
-    Sem esse painel o usuário só descobria que `var_concept` veio vazio ao
-    abrir o resultado.
-    """
+def painel_cobertura(entradas: Entradas) -> None:
+    """Antes de processar: quais campos a seleção atual preenche."""
     def item(ok: bool, texto: str, fonte: str) -> str:
-        marca = "✅" if ok else "❌"
-        sufixo = "" if ok else " — **ficará vazio**"
-        return f"- {marca} {texto} — *{fonte}*{sufixo}"
+        return f"- {'✅' if ok else '❌'} {texto} — *{fonte}*" + ("" if ok else " — **ficará vazio**")
 
     with st.container(border=True):
         st.markdown("**Cobertura de metadados com a seleção atual**")
-        st.markdown(
-            "\n".join([
-                item(True, "nomes, tipos, rótulos e categorias", "dicionário"),
-                item(tem_caderno, "conceitos e definições (`var_concept`)",
-                     "Caderno de Conceitos"),
-                item(tem_questionarios, "perguntas literais (`var_qstn_qstnlit`)",
-                     "questionários"),
-            ])
-        )
-        st.caption(
-            "`case_count` sai **0** em todos os JSONs: o ETL não lê os microdados "
-            "e portanto não conhece o número de linhas de cada tabela."
-        )
+        st.markdown("\n".join([
+            item(True, "nomes, tipos, rótulos e categorias", "dicionário"),
+            item(entradas.tem_caderno, "conceitos e definições (`var_concept`)", "Caderno de Conceitos"),
+            item(entradas.tem_questionarios, "perguntas literais (`var_qstn_qstnlit`)", "questionários"),
+        ]))
+        st.caption("`case_count` sai **0** em todos os JSONs: o ETL não lê os microdados e portanto "
+                   "não conhece o número de linhas de cada tabela.")
 
 
-# ---------------------------------------------------------------------------
-# Escolha do modo de entrada
-# ---------------------------------------------------------------------------
-modo_entrada = st.radio(
-    "Forma de envio dos insumos",
-    [MODO_ZIP, MODO_ARQUIVOS],
-    horizontal=True,
-    help="O ZIP oficial traz tudo junto (os CSVs de microdados são ignorados). "
-         "O modo por arquivos permite combinar insumos de origens/anos "
-         "diferentes — por exemplo, um dicionário novo com o Caderno e os "
-         "questionários já em mãos.",
-)
-
-limite_mb = st.get_option("server.maxUploadSize")
-st.caption(f"Limite de upload por arquivo: **{limite_mb} MB**.")
-
-arquivo_zip = None
-dicionario_up = caderno_up = None
-questionarios_up: list = []
-uploads: list = []
-usar_caderno = usar_questionarios = True
-info_zip: dict | None = None
-dicionario_bytes: bytes | None = None
-
-if modo_entrada == MODO_ZIP:
-    arquivo_zip = st.file_uploader(
-        "Arquivo .zip dos microdados",
-        type="zip",
-        help="Arquivo baixado do site do INEP — a estrutura interna de pastas "
-             "não importa; os insumos são localizados pelos próprios arquivos. "
-             "Só o dicionário, o Caderno e os questionários são extraídos.",
-    )
-    uploads = [arquivo_zip]
-
-    if arquivo_zip is not None:
-        info_zip = inspecionar_zip(arquivo_zip)
-        if info_zip is None:
-            st.error("O .zip não pôde ser lido — arquivo corrompido ou incompleto.")
+def validar(entradas: Entradas, opcoes: Opcoes) -> None:
+    if entradas.modo == MODO_ARQUIVOS:
+        # Opção marcada sem arquivo é ambígua: exige a decisão.
+        pendentes = [rotulo for rotulo, pendente in [
+            ("Caderno de Conceitos (.pdf)", entradas.usar_caderno and entradas.caderno is None),
+            ("questionários (.pdf)", entradas.usar_questionarios and not entradas.questionarios),
+        ] if pendente]
+        if pendentes:
+            st.info("Aguardando: " + ", ".join(pendentes)
+                    + ". Envie o(s) arquivo(s) ou desmarque a opção correspondente.")
             st.stop()
-        if not info_zip["dicionario"]:
-            st.error(
-                "Nenhum dicionário encontrado dentro do zip. É esperado um `.xlsx` "
-                "com 'dicionário' no nome — ou, na falta dele, um único `.xlsx` "
-                "no pacote."
-            )
-            st.stop()
-        dicionario_bytes = ler_membro_zip(arquivo_zip, info_zip["dicionario"])
-        usar_caderno = info_zip["caderno"] is not None
-        usar_questionarios = bool(info_zip["questionarios"])
-
-        with st.expander("Conteúdo identificado no zip", expanded=False):
-            st.markdown(
-                f"- **Dicionário:** `{Path(info_zip['dicionario']).name}`\n"
-                + "- **Caderno de Conceitos:** "
-                + (f"`{Path(info_zip['caderno']).name}`" if usar_caderno else "_não encontrado_")
-                + f"\n- **Questionários:** {len(info_zip['questionarios'])} PDF(s)"
-                + (f"\n- **CSVs de microdados:** {len(info_zip['csvs'])} — "
-                   "**ignorados**, o pipeline não lê os dados."
-                   if info_zip["csvs"] else "")
-            )
-else:
-    st.subheader("Insumo obrigatório")
-    dicionario_up = st.file_uploader(
-        "1. Dicionário de variáveis (.xlsx)",
-        type="xlsx",
-        help="Planilha com uma aba por tabela (Tabela_de_Escola, Tabela_de_Matrícula, …). "
-             "Fonte dos nomes, tipos, rótulos e categorias das variáveis, e a "
-             "única entrada obrigatória do serviço.",
-    )
-
-    st.subheader("Metadados opcionais")
-    usar_caderno = st.checkbox(
-        "Incluir Caderno de Conceitos",
-        value=True,
-        help="Preenche `var_concept` (conceitos e definições) e alimenta o "
-             "glossário e os quadros de referência do censo.html. Sem ele o "
-             "pipeline roda normalmente, mas esses campos ficam vazios.",
-    )
-    if usar_caderno:
-        caderno_up = st.file_uploader(
-            "2. Caderno de Conceitos e Orientações (.pdf)",
-            type="pdf",
-            help="Fonte dos conceitos (var_concept), definições e quadros de referência.",
-        )
-
-    usar_questionarios = st.checkbox(
-        "Incluir questionários",
-        value=True,
-        help="Preenche `var_qstn_qstnlit` (pergunta literal de cada variável). "
-             "Sem eles o pipeline roda normalmente, mas esse campo fica vazio.",
-    )
-    if usar_questionarios:
-        questionarios_up = st.file_uploader(
-            "3. Questionários (.pdf)",
-            type="pdf",
-            accept_multiple_files=True,
-            help="PDFs no padrão '<Nome> <ano>.pdf' (Escola, Aluno, Turma, Gestor Escolar, "
-                 "Profissional Escolar). Fonte das questões literais (var_qstn_qstnlit).",
-        ) or []
-
-    uploads = [dicionario_up, caderno_up, *questionarios_up]
-
-    if dicionario_up is not None:
-        dicionario_bytes = bytes(dicionario_up.getbuffer())
-
-# ---------------------------------------------------------------------------
-# Sem dicionário não há o que oferecer: ele define as tabelas e todo o resto.
-# ---------------------------------------------------------------------------
-if dicionario_bytes is None:
-    st.info("Aguardando o dicionário de variáveis (.xlsx).")
-    st.stop()
-
-# ---------------------------------------------------------------------------
-# Recorte por tabela — as opções vêm das abas do dicionário
-# ---------------------------------------------------------------------------
-tabelas_opcoes = tabelas_do_dicionario(dicionario_bytes)
-if not tabelas_opcoes:
-    st.error(
-        "Nenhuma aba do arquivo foi reconhecida como tabela do Censo. Confira se "
-        "o `.xlsx` enviado é mesmo o Dicionário de Variáveis do INEP (abas no "
-        "padrão `Tabela_de_Escola`, `Tabela_de_Matrícula`, …)."
-    )
-    st.stop()
-
-# A seleção vive em session_state (e não em `default=`) para que os botões
-# abaixo possam alterá-la. Como as opções mudam quando outro dicionário é
-# enviado, a seleção guardada é filtrada para nunca conter uma tabela fora
-# da lista.
-if "tabelas" not in st.session_state:
-    st.session_state.tabelas = list(tabelas_opcoes)
-else:
-    valida = [t for t in st.session_state.tabelas if t in tabelas_opcoes]
-    if valida != list(st.session_state.tabelas):
-        st.session_state.tabelas = valida
-
-st.subheader("Tabelas a processar")
-col_todas, col_limpar, _ = st.columns([1, 1, 2])
-if col_todas.button("Selecionar todas", use_container_width=True):
-    st.session_state.tabelas = list(tabelas_opcoes)
-    st.rerun()
-if col_limpar.button("Limpar seleção", use_container_width=True):
-    st.session_state.tabelas = []
-    st.rerun()
-
-tabelas_selecionadas = st.multiselect(
-    "Tabelas a processar",
-    options=tabelas_opcoes,
-    key="tabelas",
-    label_visibility="collapsed",
-    format_func=lambda t: ROTULO_TABELA.get(t, t),
-    help="Um JSON de importação por tabela marcada. O dicionário é lido por "
-         "inteiro de qualquer forma — o recorte afeta só os JSONs gerados.",
-)
-
-# ---------------------------------------------------------------------------
-# Opções de saída
-# ---------------------------------------------------------------------------
-st.subheader("Opções de saída")
-
-# Cobertura efetiva: o insumo foi pedido E existe de fato.
-if modo_entrada == MODO_ZIP:
-    # No modo ZIP a cobertura é o que a varredura encontrou dentro do arquivo.
-    tem_caderno       = bool(info_zip and info_zip["caderno"])
-    tem_questionarios = bool(info_zip and info_zip["questionarios"])
-else:
-    tem_caderno       = usar_caderno and caderno_up is not None
-    tem_questionarios = usar_questionarios and bool(questionarios_up)
-
-gerar_html = st.checkbox(
-    "Gerar censo.html (dicionário + Caderno de Conceitos + questionários)",
-    value=True,
-    help="Arquivo HTML autocontido com o dicionário de variáveis das tabelas "
-         "processadas, o glossário de conceitos e os quadros de referência do Censo.",
-)
-
-incluir_questionarios = st.checkbox(
-    "Incluir questionários (PDF) no censo.html",
-    value=True,
-    disabled=not (gerar_html and tem_questionarios),
-    help="Adiciona uma aba com as perguntas numeradas extraídas dos questionários em PDF."
-         if tem_questionarios else
-         "Indisponível: nenhum questionário foi fornecido.",
-)
-# Trava o valor efetivo — sem questionário não há aba a gerar, e deixar a flag
-# ligada faria o painel de cobertura discordar do censo.html produzido.
-incluir_questionarios = bool(incluir_questionarios and gerar_html and tem_questionarios)
-
-painel_cobertura(tem_caderno, tem_questionarios)
-
-# Resetar resultado se o conjunto de arquivos OU as opções mudarem
-opcoes_atuais = (modo_entrada, gerar_html, incluir_questionarios,
-                 usar_caderno, usar_questionarios, tuple(sorted(tabelas_selecionadas)))
-assinatura_atual = assinatura(uploads, opcoes_atuais)
-if any(u is not None for u in uploads) and assinatura_atual != st.session_state.assinatura_processada:
-    st.session_state.resultado_zip = None
-
-# ---------------------------------------------------------------------------
-# Validação das entradas
-# ---------------------------------------------------------------------------
-if modo_entrada == MODO_ARQUIVOS:
-    # Opção marcada mas arquivo não enviado é ambíguo: exigir a decisão.
-    pendentes = [
-        rotulo for rotulo, pendente in [
-            ("Caderno de Conceitos (.pdf)", usar_caderno and caderno_up is None),
-            ("questionários (.pdf)", usar_questionarios and not questionarios_up),
-        ] if pendente
-    ]
-    if pendentes:
-        st.info(
-            "Aguardando: " + ", ".join(pendentes)
-            + ". Envie o(s) arquivo(s) ou desmarque a opção correspondente."
-        )
+    if not opcoes.tabelas:
+        st.warning("Selecione pelo menos uma tabela.")
         st.stop()
 
-if not tabelas_selecionadas:
-    st.warning("Selecione pelo menos uma tabela.")
-    st.stop()
 
 # ---------------------------------------------------------------------------
 # Processamento
 # ---------------------------------------------------------------------------
-processar_disabled = st.session_state.resultado_zip is not None
-if processar_disabled:
-    st.caption(
-        "Resultado já gerado abaixo — use **Processar novo arquivo** para recomeçar."
-    )
 
-if st.button("Processar", type="primary", disabled=processar_disabled):
+class _JanelaLog(logging.Handler):
+    """Mostra as últimas `LOG_MAX` linhas do log numa caixa de código."""
 
+    def __init__(self, destino) -> None:
+        super().__init__()
+        self.destino = destino
+        self.linhas: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.escrever(self.format(record))
+
+    def escrever(self, texto: str) -> None:
+        self.linhas.extend(texto.splitlines() or [""])
+        visiveis = self.linhas[-LOG_MAX:]
+        omitidas = len(self.linhas) - len(visiveis)
+        cabecalho = [f"… ({omitidas} linha(s) anterior(es) omitida(s))"] if omitidas else []
+        self.destino.code("\n".join(cabecalho + visiveis), language="text")
+
+
+def _gravar_upload(upload, pasta: Path) -> Path:
+    """Em disco com o nome original: o nome identifica o questionário e o ano."""
+    pasta.mkdir(parents=True, exist_ok=True)
+    caminho = pasta / Path(upload.name).name
+    caminho.write_bytes(upload.getbuffer())
+    return caminho
+
+
+def _materializar(entradas: Entradas, pasta: Path) -> tuple[Path, Path | None, Path | None, list]:
+    """(dicionário, caderno, pasta de questionários, nomes extras para o ano)."""
+    if entradas.modo == MODO_ZIP:
+        extrair_insumos_zip(entradas.zip, pasta)
+        # Nada depende do nome das pastas do INEP: são deduzidas dos arquivos.
+        insumos = localizar_insumos(pasta)
+        if insumos.dicionario is None:
+            raise EntradaInvalida("Dicionário .xlsx não encontrado dentro do zip.")
+        extras = [Path(entradas.zip.name)]
+        return insumos.dicionario, insumos.caderno, insumos.pasta_questionarios, extras
+    dicionario = _gravar_upload(entradas.dicionario, pasta / "dicionario")
+    caderno = _gravar_upload(entradas.caderno, pasta / "caderno") if entradas.tem_caderno else None
+    pasta_q = None
+    if entradas.tem_questionarios:
+        pasta_q = pasta / "questionarios"
+        for upload in entradas.questionarios:
+            _gravar_upload(upload, pasta_q)
+    return dicionario, caderno, pasta_q, []
+
+
+def processar(entradas: Entradas, opcoes: Opcoes, assinatura_atual: tuple) -> None:
     inicio = time.monotonic()
     col_barra, col_cancelar = st.columns([4, 1])
     barra = col_barra.progress(0, text="Iniciando...")
-    col_cancelar.button(
-        "Cancelar",
-        help="Interrompe no próximo ponto de verificação. Nada é gravado — o "
-             "processamento roda em pasta temporária.",
-    )
-    log_container = st.empty()
-    log_lines: list[str] = []
-
-    def log(msg: str) -> None:
-        log_lines.append(msg)
-        visiveis = log_lines[-LOG_MAX:]
-        omitidas = len(log_lines) - len(visiveis)
-        cabecalho = [f"… ({omitidas} linha(s) anterior(es) omitida(s))"] if omitidas else []
-        log_container.code("\n".join(cabecalho + visiveis), language="text")
+    # Qualquer interação interrompe o script no próximo ponto de verificação;
+    # como tudo roda em pasta temporária, nada fica gravado.
+    col_cancelar.button("Cancelar", help="Interrompe no próximo ponto de verificação. Nada é "
+                                         "gravado — o processamento roda em pasta temporária.")
+    janela = _JanelaLog(st.empty())
 
     def avancar(pct: int, texto: str) -> None:
-        decorrido = int(time.monotonic() - inicio)
-        barra.progress(pct, text=f"{texto}  ·  {decorrido // 60}m{decorrido % 60:02d}s")
+        s = int(time.monotonic() - inicio)
+        barra.progress(pct, text=f"{texto}  ·  {s // 60}m{s % 60:02d}s")
 
-    def rodar_passo(rotulo: str, funcao):
-        """Executa uma etapa capturando stdout e traduzindo eventuais falhas.
+    registrar_saida(janela)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            avancar(P_ENTRADAS, "Preparando os insumos...")
+            dicionario, caderno, pasta_q, extras = _materializar(entradas, Path(tmp) / "entrada")
+            outros = [caderno, *(sorted(pasta_q.glob("*.pdf")) if pasta_q else []), *extras]
+            ano = detectar_ano_em_cascata(dicionario, outros)
+            janela.escrever(f"Dicionário   : {dicionario.name}\n"
+                            f"Questionários: {pasta_q.name if pasta_q else 'não fornecidos'}\n"
+                            f"Caderno      : {caderno.name if caderno else 'não fornecido'}\n"
+                            f"Tabelas      : {', '.join(opcoes.tabelas)}\n"
+                            f"Edição       : {ano or 'não determinada'} "
+                            f"(saída como {prefixo_edicao(ano)}microdados_tabela_*)")
 
-        Só intercepta Exception e SystemExit (os módulos sinalizam entrada
-        inválida com sys.exit) — RerunException/StopException do Streamlit
-        continuam propagando, que é o que permite o botão Cancelar funcionar.
-        """
-        buf = io.StringIO()
-        try:
-            with redirect_stdout(buf):
-                resultado = funcao()
-        except (Exception, SystemExit) as exc:
-            for linha in buf.getvalue().splitlines():
-                log(linha)
-            detalhe = explicar_erro(exc)
-            log(f"ERRO em {rotulo}: {detalhe}")
-            for linha in traceback.format_exc().splitlines():
-                log(f"  {linha}")
-            st.error(f"**{rotulo} falhou.**\n\n{detalhe}")
-            st.stop()
-        for linha in buf.getvalue().splitlines():
-            log(linha)
-        return resultado
-
-    avisos: list[str] = []
-
-    with tempfile.TemporaryDirectory() as tmp_base:
-        tmp = Path(tmp_base)
-        pasta_entrada = tmp / "entrada"
-        pasta_saida   = tmp / "saida"
-        pasta_entrada.mkdir()
-        pasta_saida.mkdir()
-
-        # ---- 1. Materializar as entradas ------------------------------------
-        if modo_entrada == MODO_ZIP:
-            avancar(P_ENTRADAS, "Extraindo os insumos do zip...")
-            log("Extraindo do zip apenas dicionário, Caderno e questionários...")
-            rodar_passo(
-                "Extração do zip",
-                lambda: extrair_insumos_zip(arquivo_zip, pasta_entrada),
+            avancar(P_METADADOS, "Gerando os metadados...")
+            resultado = gerar_metadados(
+                dicionario, Path(tmp) / "saida", pasta_q, caderno, ano=ano,
+                tabelas_alvo=opcoes.tabelas, gerar_html=opcoes.gerar_html,
+                incluir_questionarios=opcoes.incluir_questionarios,
             )
-            log("Extração concluída (CSVs de microdados não extraídos).")
+            avancar(P_EMPACOTE, "Empacotando os metadados...")
+            zip_bytes = empacotar(resultado)
+    except Exception as exc:
+        detalhe = explicar_erro(exc)
+        janela.escrever(f"ERRO: {detalhe}\n{traceback.format_exc()}")
+        st.error(f"**Processamento falhou.**\n\n{detalhe}")
+        st.stop()
+    finally:
+        remover_saida(janela)
 
-            # Localização dos insumos. Nada aqui depende do nome das PASTAS do
-            # INEP (que já mudou de "Anexos/ANEXO I - Dicionário de Dados" para
-            # "dicionario de dados"): as pastas são deduzidas de onde os
-            # arquivos reconhecidos caíram. Ver censo_lib §5.
-            insumos = rodar_passo(
-                "Identificação dos insumos",
-                lambda: localizar_insumos(pasta_entrada),
-            )
-            caminho_xlsx    = insumos["dicionario"]
-            pasta_q         = insumos["pasta_questionarios"]
-            caminho_caderno = insumos["caderno"]
-
-            if caminho_xlsx is None:
-                st.error("Dicionário .xlsx não encontrado dentro do zip.")
-                st.stop()
-        else:
-            avancar(P_ENTRADAS, "Gravando arquivos enviados...")
-            log("Gravando arquivos enviados...")
-            caminho_xlsx    = gravar_upload(dicionario_up, pasta_entrada / "dicionario")
-            caminho_caderno = (gravar_upload(caderno_up, pasta_entrada / "caderno")
-                               if tem_caderno else None)
-            pasta_q         = pasta_entrada / "questionarios" if tem_questionarios else None
-            for up in (questionarios_up if tem_questionarios else []):
-                gravar_upload(up, pasta_q)
-            log(f"  {len(questionarios_up) if tem_questionarios else 0} questionário(s) gravados.")
-
-        log(f"Dicionário   : {caminho_xlsx.name}")
-        log(f"Questionários: {pasta_q.name if pasta_q else 'não fornecidos (var_qstn ficará vazio)'}")
-        log(f"Caderno      : {caminho_caderno.name if caminho_caderno else 'não fornecido (var_concept ficará vazio)'}")
-        log(f"Tabelas      : {', '.join(tabelas_selecionadas)}")
-
-        # ---- Edição (ano) — nomeia toda a saída ------------------------------
-        # Sem os microdados não há `NU_ANO_CENSO` a consultar: o ano vem dos
-        # NOMES dos insumos. Ver censo_lib §5 e DOCUMENTACAO §4.0.
-        #
-        # O dicionário decide sozinho, e só na falta de ano no nome dele os
-        # demais insumos entram. `detectar_ano_censo` resolve empate por
-        # maioria: combinando um dicionário de 2026 com o Caderno e os cinco
-        # questionários de 2025 (§5.7), os seis nomes antigos venceriam o
-        # único novo e a saída sairia carimbada com o ano errado. Enquanto os
-        # CSVs eram lidos, `NU_ANO_CENSO` desempatava isso.
-        outros_nomes: list = [caminho_caderno]
-        if pasta_q:
-            outros_nomes += sorted(pasta_q.glob("*.pdf"))
-        if modo_entrada == MODO_ZIP:
-            outros_nomes.append(Path(arquivo_zip.name))
-
-        ano_edicao = rodar_passo(
-            "Detecção do ano da edição",
-            lambda: (detectar_ano_censo(nomes_extra=[caminho_xlsx])
-                     or detectar_ano_censo(nomes_extra=outros_nomes)),
-        )
-        if ano_edicao:
-            log(f"Edição       : {ano_edicao} "
-                f"(saída como {prefixo_edicao(ano_edicao)}microdados_tabela_*)")
-        else:
-            log(f"Edição       : não determinada — saída sem ano "
-                f"({prefixo_edicao(None)}microdados_tabela_*)")
-            avisos.append(
-                "Ano da edição não determinado (nenhum insumo traz o ano no nome) "
-                "— os arquivos saíram como "
-                f"`{prefixo_edicao(None)}microdados_tabela_*`. Renomeie o "
-                "dicionário incluindo o ano para corrigir."
-            )
-
-        if not caminho_caderno:
-            avisos.append("Caderno de Conceitos ausente — `var_concept` ficou vazio.")
-        if not pasta_q:
-            avisos.append("Questionários ausentes — `var_qstn_qstnlit` ficou vazio.")
-
-        # ---- Geração dos metadados -------------------------------------------
-        avancar(P_PASSO1, "Gerando os metadados...")
-        log("\n=== Gerando JSONs de metadados ===")
-
-        def gerar():
-            from gerar_json_metadata_editor import executar as gerar_jsons
-            return gerar_jsons(
-                caminho_xlsx, pasta_saida, pasta_q, caminho_caderno,
-                gerar_html=gerar_html, incluir_questionarios=incluir_questionarios,
-                tabelas_alvo=tabelas_selecionadas, ano=ano_edicao,
-            )
-
-        rodar_passo("Geração dos metadados", gerar)
-
-        # ---- Empacotar para download -----------------------------------------
-        avancar(P_EMPACOTE, "Empacotando os metadados...")
-        log("\n=== Empacotando os metadados para download ===")
-        # Só os JSONs de importação das tabelas processadas — os caches
-        # intermediários do Caderno ficam de fora do pacote.
-        arquivos_json = sorted(pasta_saida.glob("*_import_metadata_editor.json"))
-        caminho_censo_html = pasta_saida / f"{prefixo_edicao(ano_edicao)}censo.html"
-        caminho_relatorio = pasta_saida / f"{prefixo_edicao(ano_edicao)}relatorio_casamento.csv"
-        if not arquivos_json:
-            st.error(
-                "Nenhum JSON de metadados foi gerado. Verifique no log acima se as "
-                "abas do dicionário correspondem às tabelas selecionadas."
-            )
-            st.stop()
-
-        zip_out = io.BytesIO()
-        with zipfile.ZipFile(zip_out, "w", zipfile.ZIP_DEFLATED) as zout:
-            for js in arquivos_json:
-                zout.write(js, f"json/{js.name}")
-                log(f"  + json/{js.name}")
-            if caminho_censo_html.is_file():
-                zout.write(caminho_censo_html, caminho_censo_html.name)
-                log(f"  + {caminho_censo_html.name}")
-            if caminho_relatorio.is_file():
-                zout.write(caminho_relatorio, caminho_relatorio.name)
-                log(f"  + {caminho_relatorio.name}")
-        zip_out.seek(0)
-
-        st.session_state.resultado_zip = zip_out.getvalue()
-        st.session_state.assinatura_processada = assinatura_atual
-        st.session_state.avisos = avisos
-        st.session_state.duracao = time.monotonic() - inicio
-
-        avancar(100, "Concluído!")
-        log(f"\nConcluído! {len(arquivos_json)} .json gerado(s)"
-            f"{' + ' + caminho_censo_html.name if caminho_censo_html.is_file() else ''}.")
-
+    st.session_state.resultado = ResultadoApp(
+        zip_bytes=zip_bytes, n_json=len(resultado.jsons),
+        tem_censo_html=resultado.censo_html is not None,
+        duracao=time.monotonic() - inicio,
+        avisos=avisos_de_lacunas(ano, caderno is not None, pasta_q is not None),
+    )
+    st.session_state.assinatura = assinatura_atual
+    avancar(100, "Concluído!")
     st.rerun()
 
-# ---------------------------------------------------------------------------
-# Download
-# ---------------------------------------------------------------------------
-if st.session_state.resultado_zip:
-    nomes = zipfile.ZipFile(io.BytesIO(st.session_state.resultado_zip)).namelist()
-    n_json = sum(1 for n in nomes if n.endswith(".json"))
-    tem_censo_html = any(n.endswith("censo.html") for n in nomes)
-    msg = f"Metadados gerados — {n_json} .json"
-    msg += " + censo.html" if tem_censo_html else ""
-    if st.session_state.duracao:
-        segundos = int(st.session_state.duracao)
-        msg += f" em {segundos // 60}m{segundos % 60:02d}s."
-    else:
-        msg += "."
-    st.success(msg)
 
-    # Falhas parciais e lacunas de metadados: visíveis mesmo depois que o log
-    # rolou, para ninguém sair achando que a execução foi 100% completa.
-    for aviso in st.session_state.avisos:
+def mostrar_resultado() -> None:
+    resultado: ResultadoApp | None = st.session_state.resultado
+    if resultado is None:
+        return
+    st.success(mensagem_sucesso(resultado))
+    for aviso in resultado.avisos:
         st.warning(aviso)
-
-    st.download_button(
-        label="Baixar metadados (ZIP)",
-        data=st.session_state.resultado_zip,
-        file_name="censo_escolar_metadados.zip",
-        mime="application/zip",
-    )
+    st.download_button("Baixar metadados (ZIP)", data=resultado.zip_bytes,
+                       file_name=NOME_PACOTE, mime="application/zip")
     if st.button("Processar novo arquivo"):
-        st.session_state.resultado_zip = None
-        st.session_state.assinatura_processada = None
-        st.session_state.avisos = []
-        st.session_state.duracao = None
+        st.session_state.resultado = None
+        st.session_state.assinatura = None
         st.rerun()
+
+
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    st.set_page_config(page_title="Censo Escolar — Gerador de metadados", page_icon="📊",
+                       layout="centered")
+    st.title("Censo Escolar — Gerador de metadados")
+    st.markdown("Gera os `.json` de importação do **World Bank Metadata Editor**, o `censo.html` "
+                "navegável e o relatório de casamento. **O único insumo obrigatório é o dicionário "
+                "de variáveis** — os microdados não são lidos.")
+    st.session_state.setdefault("resultado", None)
+    st.session_state.setdefault("assinatura", None)
+
+    entradas = coletar_entradas()
+    if entradas.dicionario_bytes is None:
+        st.info("Aguardando o dicionário de variáveis (.xlsx).")
+        st.stop()
+    tabelas = escolher_tabelas(entradas.dicionario_bytes)
+    opcoes = escolher_opcoes(entradas, tabelas)
+    painel_cobertura(entradas)
+
+    # Mudar arquivo ou opção descarta o resultado anterior.
+    assinatura_atual = assinatura(entradas.uploads, (
+        entradas.modo, opcoes.gerar_html, opcoes.incluir_questionarios,
+        entradas.usar_caderno, entradas.usar_questionarios, tuple(sorted(opcoes.tabelas))))
+    if assinatura_atual != st.session_state.assinatura:
+        st.session_state.resultado = None
+
+    validar(entradas, opcoes)
+    ja_processado = st.session_state.resultado is not None
+    if ja_processado:
+        st.caption("Resultado já gerado abaixo — use **Processar novo arquivo** para recomeçar.")
+    if st.button("Processar", type="primary", disabled=ja_processado):
+        processar(entradas, opcoes, assinatura_atual)
+    mostrar_resultado()
+
+
+main()
