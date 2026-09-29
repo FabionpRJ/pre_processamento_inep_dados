@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-TEMPLATE_PATH = Path(__file__).parent / "templates" / "censo_template.html"
+TEMPLATE_PATH = Path(__file__).parent / "censo_etl" / "templates" / "censo_template.html"
 MARCADOR = "__APP_DATA__"
 
 
