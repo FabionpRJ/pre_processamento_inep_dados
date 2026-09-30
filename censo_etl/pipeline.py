@@ -88,8 +88,16 @@ def gerar_metadados(
     return resultado
 
 
-def _executar(caminho_dicionario, pasta_saida, pasta_questionarios, caminho_caderno,
-              ano, tabelas_alvo, gerar_html, incluir_questionarios) -> ResultadoExecucao:
+def _executar(
+    caminho_dicionario: Path,
+    pasta_saida: Path,
+    pasta_questionarios: Path | None,
+    caminho_caderno: Path | None,
+    ano: str | None,
+    tabelas_alvo: list[str] | None,
+    gerar_html: bool,
+    incluir_questionarios: bool,
+) -> ResultadoExecucao:
     if not caminho_dicionario.exists():
         raise EntradaInvalida(f'Arquivo não encontrado: "{caminho_dicionario}"')
     log.info('Lendo dicionário: "%s"', caminho_dicionario)
