@@ -43,8 +43,8 @@ censo_html_dados.json
 # Insumos de exemplo
 # ---------------------------------------------------------------------------
 # Pacotes do INEP guardados como exemplo de formato de entrada. São centenas de
-# MB; o comportamento que eles exercitam está fixado em testar_identificacao.py,
-# que roda só com nomes e não precisa dos arquivos.
+# MB; o comportamento de identificação está fixado em tests/test_identificacao.py,
+# que roda só com nomes. tests/test_paridade.py usa estes arquivos quando existem.
 exemplo_input/
 
 # ---------------------------------------------------------------------------
@@ -52,7 +52,7 @@ exemplo_input/
 # ---------------------------------------------------------------------------
 # Mesma regra que tirou RECOMMENDATION*.md do repositório: material de reunião
 # e apresentação envelhece a cada edição e não é necessário para rodar o app.
-# O que vale fica em DOCUMENTACAO.md e README.md.
+# O que vale fica em docs/ e README.md.
 ALTERACOES.md
 *.pdf
 

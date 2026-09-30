@@ -1,4 +1,4 @@
-"""Códigos do dicionário que NÃO são categoria (docs/especificacao.md §valores especiais).
+"""Códigos do dicionário que NÃO são categoria (docs/especificacao.md §7.2).
 
 O dicionário lista, junto das categorias, marcas de que o valor observado não
 existe ou foi tratado pelo produtor — em 2025: 88888 ("valor extremo"),
