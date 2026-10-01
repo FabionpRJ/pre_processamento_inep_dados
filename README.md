@@ -36,6 +36,39 @@ pip install -r requirements.txt          # requirements-dev.txt para testes
 Roteiro para servidor Linux com systemd. Os caminhos (`/opt/censo-etl`), o
 usuário (`censo`) e a porta (`8501`) são sugestões; ajuste ao padrão da casa.
 
+### Dimensionamento
+
+Medido com o pacote completo do INEP de 2025 (ZIP de 75 MB, as seis tabelas,
+com Caderno, questionários e `censo.html`), que é o caso mais pesado da
+interface, num Intel Core i5-1135G7:
+
+| Medida | Valor |
+|---|---|
+| Tempo de um processamento | ~36 s |
+| CPU | 1 núcleo (o código não paraleliza) |
+| Pico de RAM do processo durante um processamento | ~800 MB |
+| RAM do Streamlit ocioso | ~60 MB |
+| Disco temporário por processamento | ~30 MB extraídos + o upload |
+| Ambiente Python instalado (`venv`) | ~0,5 GB |
+
+O Streamlit atende todos os usuários num único processo. Processamentos
+simultâneos somam memória (~800 MB cada) e disputam praticamente um núcleo,
+porque a leitura dos PDFs é Python puro (GIL). Mais núcleos não aceleram um
+processamento nem paralelizam vários.
+
+| Recurso | Mínimo | Recomendado (2–3 usos simultâneos) |
+|---|---|---|
+| vCPU | 1 | 2 |
+| RAM | 2 GB | 4 GB |
+| Disco | 5 GB | 10 GB |
+| GPU | não usa | não usa |
+
+- O disco cobre o sistema, o `venv`, o código e o `/tmp`. Nada é gravado de
+  forma permanente: cada processamento usa uma pasta temporária, apagada ao
+  final.
+- Não há banco de dados nem serviço externo. Só a instalação (`pip`, `git`)
+  precisa de internet; em operação, o app não faz chamadas para fora.
+
 ### 1. Pré-requisitos
 
 - **Arquitetura: x86_64 (Intel/AMD) ou ARM64 (aarch64).** Não é preciso ARM;
@@ -48,9 +81,6 @@ usuário (`censo`) e a porta (`8501`) são sugestões; ajuste ao padrão da casa
 - **Python 3.13** com `venv` (`python3.13 --version`). Se a distribuição não
   trouxer o 3.13, instale-o pelo gerenciador de pacotes, pelo `uv` ou compilado.
 - `git` e acesso de leitura ao repositório.
-- Disco: nada é gravado de forma permanente; cada processamento usa uma pasta
-  temporária do sistema (`/tmp`), apagada ao final. Reserve espaço em `/tmp`
-  para o tamanho dos uploads.
 
 ### 2. Usuário e código
 
