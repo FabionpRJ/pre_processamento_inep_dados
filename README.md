@@ -31,6 +31,136 @@ source venv/bin/activate
 pip install -r requirements.txt          # requirements-dev.txt para testes
 ```
 
+## Instalação no servidor
+
+Roteiro para servidor Linux com systemd. Os caminhos (`/opt/censo-etl`), o
+usuário (`censo`) e a porta (`8501`) são sugestões; ajuste ao padrão da casa.
+
+### 1. Pré-requisitos
+
+- **Python 3.13** com `venv` (`python3.13 --version`). Se a distribuição não
+  trouxer o 3.13, instale-o pelo gerenciador de pacotes, pelo `uv` ou compilado.
+- `git` e acesso de leitura ao repositório.
+- Disco: nada é gravado de forma permanente; cada processamento usa uma pasta
+  temporária do sistema (`/tmp`), apagada ao final. Reserve espaço em `/tmp`
+  para o tamanho dos uploads.
+
+### 2. Usuário e código
+
+```bash
+sudo useradd --system --create-home --home-dir /opt/censo-etl --shell /usr/sbin/nologin censo
+sudo -u censo git clone https://github.com/FabionpRJ/pre_processamento_inep_dados.git /opt/censo-etl/app
+cd /opt/censo-etl/app
+sudo -u censo git checkout main        # ou a tag/branch homologada
+```
+
+### 3. Ambiente Python
+
+```bash
+sudo -u censo python3.13 -m venv /opt/censo-etl/venv
+sudo -u censo /opt/censo-etl/venv/bin/pip install --upgrade pip
+sudo -u censo /opt/censo-etl/venv/bin/pip install -r /opt/censo-etl/app/requirements.txt
+```
+
+Atrás de proxy corporativo, exporte `HTTPS_PROXY` antes do `pip` (ou use
+`pip --proxy`).
+
+Teste rápido, ainda sem serviço:
+
+```bash
+sudo -u censo /opt/censo-etl/venv/bin/python -m censo_etl --help
+```
+
+### 4. Configuração do Streamlit
+
+Crie `/opt/censo-etl/app/.streamlit/config.toml`:
+
+```toml
+[server]
+headless = true
+address = "127.0.0.1"     # só o proxy reverso acessa; use "0.0.0.0" se não houver proxy
+port = 8501
+maxUploadSize = 1024      # MB; o padrão (200) não comporta o ZIP completo do INEP
+
+[browser]
+gatherUsageStats = false
+```
+
+### 5. Serviço systemd
+
+Crie `/etc/systemd/system/censo-etl.service`:
+
+```ini
+[Unit]
+Description=Censo Escolar - gerador de metadados (Streamlit)
+After=network.target
+
+[Service]
+User=censo
+Group=censo
+WorkingDirectory=/opt/censo-etl/app
+ExecStart=/opt/censo-etl/venv/bin/streamlit run app.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now censo-etl
+sudo systemctl status censo-etl
+curl -s http://127.0.0.1:8501/_stcore/health    # deve responder "ok"
+```
+
+Logs: `journalctl -u censo-etl -f`.
+
+### 6. Proxy reverso (nginx)
+
+O Streamlit usa WebSocket; o proxy precisa repassar o `Upgrade` e aceitar
+uploads do mesmo tamanho de `maxUploadSize`. Exemplo de `server` do nginx:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name censo-etl.empresa.local;
+    # ssl_certificate / ssl_certificate_key conforme o padrão da casa
+
+    client_max_body_size 1024m;
+
+    location / {
+        proxy_pass http://127.0.0.1:8501;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 3600s;    # processamentos com o Caderno levam minutos
+        proxy_send_timeout 3600s;
+    }
+}
+```
+
+Para publicar sob um subcaminho (ex.: `https://intranet/censo-etl/`), use
+`location /censo-etl/` e acrescente `baseUrlPath = "censo-etl"` em `[server]`
+no `config.toml`.
+
+**O app não tem autenticação.** Restrinja o acesso pela rede interna, pelo
+proxy (`auth_basic`, SSO) ou pelo firewall.
+
+### 7. Atualização
+
+```bash
+cd /opt/censo-etl/app
+sudo -u censo git pull
+sudo -u censo /opt/censo-etl/venv/bin/pip install -r requirements.txt
+sudo systemctl restart censo-etl
+```
+
+Ao trocar a versão do Python, recrie o `venv` (passo 3).
+
 ## Uso
 
 ```bash
