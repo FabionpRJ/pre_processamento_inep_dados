@@ -38,6 +38,13 @@ usuário (`censo`) e a porta (`8501`) são sugestões; ajuste ao padrão da casa
 
 ### 1. Pré-requisitos
 
+- **Arquitetura: x86_64 (Intel/AMD) ou ARM64 (aarch64).** Não é preciso ARM;
+  todas as dependências fixadas em `requirements.txt` têm pacotes binários
+  prontos para as duas arquiteturas, e nada é compilado na instalação. Outras
+  arquiteturas (32 bits, ppc64le, s390x) não foram verificadas.
+- **Linux com glibc 2.28 ou mais nova** (`ldd --version`): RHEL/Rocky/Alma 8+,
+  Debian 10+, Ubuntu 20.04+. Distribuições com musl (Alpine) não têm esses
+  pacotes binários e exigiriam compilação.
 - **Python 3.13** com `venv` (`python3.13 --version`). Se a distribuição não
   trouxer o 3.13, instale-o pelo gerenciador de pacotes, pelo `uv` ou compilado.
 - `git` e acesso de leitura ao repositório.
