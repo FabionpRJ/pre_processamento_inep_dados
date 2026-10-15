@@ -3,3 +3,15 @@ pandas==3.0.3
 pyreadstat==1.3.5
 openpyxl==3.1.5
 pdfplumber==0.11.10
+
+# Dependências indiretas fixadas de propósito.
+# starlette: o Streamlit 1.58 aceita starlette>=0.40 sem teto, e a 1.8.0 mudou o
+# GZipMiddleware de um jeito que quebra o subclass do Streamlit — toda resposta
+# que não é comprimida (o ZIP do download, imagens, fontes) sai sem cabeçalho
+# ("Expected ASGI message 'http.response.start'") e o navegador recebe erro.
+# Só subir junto com um Streamlit que já trate isso (1.66 trata).
+starlette==1.7.0
+uvicorn==0.54.0
+numpy==2.5.4
+# 26.0.0 tem segfault conhecido; é a versão que o Community Cloud usa no lugar.
+pyarrow==24.0.0
