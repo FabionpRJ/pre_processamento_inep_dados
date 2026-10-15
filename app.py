@@ -47,6 +47,9 @@ MODO_ARQUIVOS = "Arquivos separados"
 LOG_MAX = 50                                     # linhas visíveis na janela de log
 P_ENTRADAS, P_METADADOS, P_EMPACOTE = 10, 90, 95  # faixas da barra de progresso
 
+# Fora do logger "censo_etl", que vai para a janela da sessão.
+_log = logging.getLogger("app")
+
 
 @dataclass
 class Entradas:
@@ -341,6 +344,8 @@ def processar(entradas: Entradas, opcoes: Opcoes, assinatura_atual: tuple) -> No
             zip_bytes = empacotar(resultado)
     except Exception as exc:
         detalhe = explicar_erro(exc)
+        # Também no log do servidor (o do Community Cloud), não só na janela da sessão.
+        _log.exception("Processamento falhou: %s", detalhe)
         janela.escrever(f"ERRO: {detalhe}\n{traceback.format_exc()}")
         st.error(f"**Processamento falhou.**\n\n{detalhe}")
         st.stop()
@@ -365,8 +370,9 @@ def mostrar_resultado() -> None:
     st.success(mensagem_sucesso(resultado))
     for aviso in resultado.avisos:
         st.warning(aviso)
+    # "ignore": baixar não reexecuta o script (nem relê o zip e o dicionário).
     st.download_button("Baixar metadados (ZIP)", data=resultado.zip_bytes,
-                       file_name=NOME_PACOTE, mime="application/zip")
+                       file_name=NOME_PACOTE, mime="application/zip", on_click="ignore")
     if st.button("Processar novo arquivo"):
         st.session_state.resultado = None
         st.session_state.assinatura = None

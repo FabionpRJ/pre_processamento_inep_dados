@@ -70,6 +70,26 @@ def test_so_dicionario(dicionario_minimo):
     assert not _widget(at.button, "Processar").disabled
 
 
+def test_falha_no_processamento_aparece_na_tela_e_no_log(dicionario_minimo, monkeypatch, caplog):
+    import censo_etl.pipeline
+
+    def falhar(*args, **kwargs):
+        raise RuntimeError("falha simulada")
+
+    monkeypatch.setattr(censo_etl.pipeline, "gerar_metadados", falhar)
+    at = _app()
+    _modo_arquivos(at)
+    _widget(at.file_uploader, "Dicionário").set_value(
+        (dicionario_minimo.name, dicionario_minimo.read_bytes(), "application/octet-stream")).run()
+    _widget(at.checkbox, "Incluir Caderno").uncheck().run()
+    _widget(at.checkbox, "Incluir questionários").uncheck().run()
+    _widget(at.button, "Processar").click().run()
+    assert at.error[0].value == "**Processamento falhou.**\n\nRuntimeError: falha simulada"
+    assert at.session_state["resultado"] is None
+    registro = next(r for r in caplog.records if r.name == "app")
+    assert registro.exc_info and "falha simulada" in registro.getMessage()
+
+
 @pytest.fixture(autouse=True)
 def _sem_estatisticas(monkeypatch):
     monkeypatch.setenv("STREAMLIT_BROWSER_GATHER_USAGE_STATS", "false")
