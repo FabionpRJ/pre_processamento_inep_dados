@@ -23,7 +23,10 @@ questionários .pdf (opcionais)  ─┘          ceb2025_censo.html          (gl
 
 ## Instalação
 
-Python 3.13.
+Python 3.13. As versões em `requirements.txt` são fixadas, inclusive algumas
+dependências indiretas. A Starlette fica na 1.7.0 porque a 1.8.0 quebra o
+download no Streamlit 1.58 (ver [docs/historico.md](docs/historico.md), §8.14).
+Só suba a Starlette junto com um Streamlit que trate a mudança.
 
 ```bash
 python -m venv venv
@@ -46,20 +49,20 @@ interface, num Intel Core i5-1135G7:
 |---|---|
 | Tempo de um processamento | ~36 s |
 | CPU | 1 núcleo (o código não paraleliza) |
-| Pico de RAM do processo durante um processamento | ~800 MB |
+| Pico de RAM do processo durante um processamento | ~290 MB |
 | RAM do Streamlit ocioso | ~60 MB |
 | Disco temporário por processamento | ~30 MB extraídos + o upload |
 | Ambiente Python instalado (`venv`) | ~0,5 GB |
 
 O Streamlit atende todos os usuários num único processo. Processamentos
-simultâneos somam memória (~800 MB cada) e disputam praticamente um núcleo,
+simultâneos somam memória (~230 MB cada) e disputam praticamente um núcleo,
 porque a leitura dos PDFs é Python puro (GIL). Mais núcleos não aceleram um
 processamento nem paralelizam vários.
 
 | Recurso | Mínimo | Recomendado (2–3 usos simultâneos) |
 |---|---|---|
 | vCPU | 1 | 2 |
-| RAM | 2 GB | 4 GB |
+| RAM | 1 GB | 2 GB |
 | Disco | 5 GB | 10 GB |
 | GPU | não usa | não usa |
 
@@ -197,6 +200,15 @@ sudo systemctl restart censo-etl
 ```
 
 Ao trocar a versão do Python, recrie o `venv` (passo 3).
+
+## Streamlit Community Cloud
+
+- **Dependências:** só `requirements.txt`. Não há `pyproject.toml`; a
+  configuração de pytest e ruff fica em `pytest.ini` e `ruff.toml`.
+- **Python:** escolha **3.13** em *Advanced settings* ao criar o app. O Cloud
+  não lê a versão do repositório, e ela só muda apagando e recriando o app.
+- **Memória:** um processamento completo ocupa ~290 MB, dentro do limite de
+  ~1 GB, mas processamentos simultâneos somam memória (~230 MB cada).
 
 ## Uso
 

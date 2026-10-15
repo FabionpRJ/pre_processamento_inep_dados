@@ -650,6 +650,57 @@ diferença** nos JSONs (objeto e bytes), relatórios (bytes), `censo.html`
 8 cenários de `AppTest` com as mesmas mensagens, botões, opções e conteúdo do
 pacote baixado. O teste de paridade está em `tests/test_paridade.py`.
 
+## 8.14 Download quebrado no Community Cloud e memória dos PDFs (2026-10)
+
+**Sintoma.** No Streamlit Community Cloud, o clique em "Baixar metadados (ZIP)"
+dava "site not available". O log não tinha erro do app, mas repetia
+`RuntimeError: Expected ASGI message 'http.response.start', but got
+'http.response.body'`, passando por `starlette_gzip_middleware.py`.
+
+**Causa.** O Streamlit 1.58 aceita `starlette>=0.40.0` sem teto, e o Cloud
+instalou a Starlette 1.8.0. Nessa versão o `IdentityResponder` do
+`GZipMiddleware` passou a enviar o `http.response.start` ao tratar o próprio
+start quando a resposta não será comprimida (content-type excluído, como
+`application/zip` e imagens, ou já codificada), e o ramo do body deixou de
+enviá-lo. O Streamlit 1.58 sobrescreve o tratamento do start
+(`_handle_response_start`) sem enviar nada, então o body sai sem cabeçalho. Toda
+rota fora de `/static/` com esse content-type falha: o `/media/<id>.zip` do
+download e o `/favicon.png`.
+
+**Como se confirmou.** Python 3.14, Streamlit 1.58.0 e Starlette 1.8.0 (o
+ambiente do log): `/favicon.png` e `/media/<id>.zip` respondem 500 com o mesmo
+`RuntimeError`, e o download no Chromium termina cancelado. Trocando só a
+Starlette para 1.7.0, os dois passam a responder 200 e o ZIP baixado abre. O
+Python 3.14 não influi. O Streamlit 1.66 já funciona com a Starlette 1.8.0.
+
+**O que mudou.**
+
+- `requirements.txt` fixa `starlette==1.7.0` e as outras dependências indiretas
+  relevantes (`uvicorn`, `numpy`, `pyarrow==24.0.0`, que é a versão que o Cloud
+  usa no lugar da 26.0.0).
+- A configuração de pytest e ruff saiu do `pyproject.toml` (para `pytest.ini` e
+  `ruff.toml`). O Cloud avisava que havia dois arquivos de dependências, e o
+  `pyproject.toml` não declarava nenhuma.
+- O botão de download usa `on_click="ignore"`: baixar não reexecuta o script.
+  O ETL já não rodava de novo, porque o resultado fica em `st.session_state`.
+- Falha no processamento também vai para o log do servidor (logger `app`), não
+  só para a janela da sessão.
+
+**Memória.** O pico de RSS de um processamento completo era de ~800 MB, perto
+do limite de ~1 GB do Community Cloud. Vinha do pdfplumber, que guarda o layout
+de toda página lida até fechar o PDF. Cada uma das três passadas pelo Caderno
+(126 páginas) segurava de 370 a 570 MB. Agora cada página é fechada
+(`page.close()`) logo depois de lida, e `extrair_conceitos` faz uma passada só,
+parando no primeiro quadro.
+
+| Medida (ZIP oficial de 2025, seis tabelas, com Caderno e questionários) | Antes | Depois |
+|---|---|---|
+| `extrair_conceitos` / `extrair_quadros` / `extrair_secoes` | +372 / +568 / +554 MB | +14 / +18 / +18 MB |
+| Pico de RSS do pipeline isolado | 806 MB | 172 MB |
+| Pico de RSS do servidor Streamlit (upload, processamento e download) | — | 287 MB |
+
+A saída ficou idêntica byte a byte (os 8 arquivos do ZIP).
+
 ---
 
 ## 9. Verificações anteriores à refatoração
