@@ -41,10 +41,12 @@ def _secao_do_cabecalho(linha: str) -> str | None:
 def _linhas_do_pdf(caminho_pdf: Path) -> list[str]:
     import pdfplumber
 
+    linhas: list[str] = []
     with pdfplumber.open(caminho_pdf) as pdf:
-        return [s for page in pdf.pages
-                for bruta in (page.extract_text() or "").split("\n")
-                if (s := bruta.strip())]
+        for page in pdf.pages:
+            linhas += [s for bruta in (page.extract_text() or "").split("\n") if (s := bruta.strip())]
+            page.close()  # o pdfplumber guarda o layout de cada página até fechar o PDF
+    return linhas
 
 
 def extrair_secoes(caminho_pdf: Path) -> dict[str, dict[str, list]]:

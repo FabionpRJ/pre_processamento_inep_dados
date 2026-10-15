@@ -144,6 +144,7 @@ def extrair_quadros(caminho_pdf: Path) -> list[dict]:
             texto = (page.extract_text() or "").lstrip()
             if quadro := next((q for q in QUADROS if texto.startswith(q.cabecalho)), None):
                 paginas[quadro.id].append(page.extract_tables())
+            page.close()  # o pdfplumber guarda o layout de cada página até fechar o PDF
 
     resultado = []
     for q in QUADROS:

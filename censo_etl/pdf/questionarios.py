@@ -43,6 +43,7 @@ def extrair_questionario(pdf_path: Path) -> list[dict]:
                     if texto_garbled(texto) or _MULTI_QUESTAO_RE.search(texto):
                         continue
                     perguntas.append({"numero": m.group(1), "texto": texto})
+                page.close()  # o pdfplumber guarda o layout de cada página até fechar o PDF
     except Exception as exc:
         log.warning("Erro ao ler %s: %s", pdf_path.name, exc)
 
@@ -89,6 +90,7 @@ def extrair_por_layout(pdf_path: Path) -> list[dict]:
                     if texto and chars:
                         tamanho = Counter(round(c["size"], 1) for c in chars).most_common(1)[0][0]
                         linhas.append((tamanho, texto))
+                page.close()
     except Exception as exc:
         log.warning("Erro ao ler layout de %s: %s", pdf_path.name, exc)
         return []

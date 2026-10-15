@@ -218,21 +218,22 @@ def extrair_conceitos(caminho_pdf: Path) -> list[dict]:
     leitor = _Leitor()
     with pdfplumber.open(caminho_pdf) as pdf:
         # Páginas de conceitos: da 1ª com "QUESTIONÁRIO DE ESCOLA" até antes do
-        # 1º quadro. O texto é extraído sob demanda — os quadros são dezenas de páginas.
+        # 1º quadro, numa passada só. Cada página é fechada assim que lida: o
+        # pdfplumber guarda o layout de todas até fechar o PDF (centenas de MB no
+        # Caderno), e as dezenas de páginas de quadros nem chegam a ser lidas.
         paginas = pdf.pages
-        texto = [None] * len(paginas)
-
-        def texto_da(i: int) -> str:
-            if texto[i] is None:
-                texto[i] = paginas[i].extract_text() or ""
-            return texto[i]
-
-        inicio = next((i for i in range(len(paginas)) if "QUESTIONÁRIO DE ESCOLA" in texto_da(i).upper()), 0)
-        fim = next((i for i in range(inicio, len(paginas)) if texto_da(i).lstrip().startswith("QUADRO DE")),
-                   len(paginas))
-        for i in range(inicio, fim):
-            for run in _runs(paginas[i]):
+        inicio = 0
+        for i, pagina in enumerate(paginas):
+            if "QUESTIONÁRIO DE ESCOLA" in (pagina.extract_text() or "").upper():
+                inicio = i
+                break
+            pagina.close()
+        for pagina in paginas[inicio:]:
+            if (pagina.extract_text() or "").lstrip().startswith("QUADRO DE"):
+                break
+            for run in _runs(pagina):
                 leitor.consumir(run)
+            pagina.close()
     leitor.terminar()
 
     resultado = []
